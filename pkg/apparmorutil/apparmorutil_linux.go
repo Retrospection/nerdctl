@@ -23,10 +23,45 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/containerd/containerd/pkg/apparmor"
-	"github.com/containerd/containerd/pkg/userns"
-	"github.com/sirupsen/logrus"
+	"github.com/moby/sys/userns"
+
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/internal/filesystem"
 )
+
+var (
+	appArmorSupported bool
+	checkAppArmor     sync.Once
+)
+
+// hostSupports returns true if apparmor is enabled for the host
+// We cannot use containerd implementation because it explicitly prevents it from working inside a container.
+func hostSupports() bool {
+	checkAppArmor.Do(func() {
+		var pth string
+		if _, err := os.Stat("/sys/kernel/security/apparmor"); err != nil {
+			appArmorSupported = false
+			return
+		}
+		// In some rare circumstances, apparmor may be enabled, but the tooling could be missing
+		// containerd implementation shells out to aa-parser, so, require it here.
+		// See https://github.com/containerd/nerdctl/issues/3945 for details.
+		pth, err := exec.LookPath("apparmor_parser")
+		if err != nil {
+			appArmorSupported = false
+			return
+		}
+		if _, err = os.Stat(pth); err != nil {
+			appArmorSupported = false
+			return
+		}
+		var buf []byte
+		buf, err = filesystem.ReadFile("/sys/module/apparmor/parameters/enabled")
+		appArmorSupported = err == nil && len(buf) == 2 && string(buf) == "Y\n"
+	})
+	return appArmorSupported
+}
 
 // CanLoadNewProfile returns whether the current process can load a new AppArmor profile.
 //
@@ -36,7 +71,7 @@ import (
 //
 // Related: https://gitlab.com/apparmor/apparmor/-/blob/v3.0.3/libraries/libapparmor/src/kernel.c#L311
 func CanLoadNewProfile() bool {
-	return !userns.RunningInUserNS() && os.Geteuid() == 0 && apparmor.HostSupports()
+	return !userns.RunningInUserNS() && os.Geteuid() == 0 && hostSupports()
 }
 
 var (
@@ -55,8 +90,8 @@ var (
 // Related: https://gitlab.com/apparmor/apparmor/-/blob/v3.0.3/libraries/libapparmor/src/kernel.c#L311
 func CanApplyExistingProfile() bool {
 	paramEnabledOnce.Do(func() {
-		buf, err := os.ReadFile("/sys/module/apparmor/parameters/enabled")
-		paramEnabled = err == nil && len(buf) > 1 && buf[0] == 'Y'
+		buf, err := filesystem.ReadFile("/sys/module/apparmor/parameters/enabled")
+		paramEnabled = err == nil && len(buf) == 2 && string(buf) == "Y\n"
 	})
 	return paramEnabled
 }
@@ -73,7 +108,7 @@ func CanApplySpecificExistingProfile(profileName string) bool {
 	cmd := exec.Command("aa-exec", "-p", profileName, "--", "true")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		logrus.WithError(err).Debugf("failed to run %v: %q", cmd.Args, string(out))
+		log.L.WithError(err).Debugf("failed to run %v: %q", cmd.Args, string(out))
 		return false
 	}
 	return true
@@ -99,9 +134,9 @@ func Profiles() ([]Profile, error) {
 	res := make([]Profile, len(ents))
 	for i, ent := range ents {
 		namePath := filepath.Join(profilesPath, ent.Name(), "name")
-		b, err := os.ReadFile(namePath)
+		b, err := filesystem.ReadFile(namePath)
 		if err != nil {
-			logrus.WithError(err).Warnf("failed to read %q", namePath)
+			log.L.WithError(err).Warnf("failed to read %q", namePath)
 			continue
 		}
 		profile := Profile{
@@ -110,7 +145,7 @@ func Profiles() ([]Profile, error) {
 		modePath := filepath.Join(profilesPath, ent.Name(), "mode")
 		b, err = os.ReadFile(modePath)
 		if err != nil {
-			logrus.WithError(err).Warnf("failed to read %q", namePath)
+			log.L.WithError(err).Warnf("failed to read %q", namePath)
 		} else {
 			profile.Mode = strings.TrimSpace(string(b))
 		}

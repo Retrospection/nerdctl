@@ -21,7 +21,8 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/containerd/nerdctl/pkg/containerutil"
+	"github.com/containerd/nerdctl/v2/pkg/containerutil"
+	"github.com/containerd/nerdctl/v2/pkg/portutil"
 )
 
 // PortOptions has args for getting the public port of a given private port/protocol
@@ -31,6 +32,8 @@ type PortOptions struct {
 	Index       int
 	Port        int
 	Protocol    string
+	DataStore   string
+	Namespace   string
 }
 
 // Port gets the corresponding public port of a given private port/protocol
@@ -38,7 +41,7 @@ type PortOptions struct {
 func (c *Composer) Port(ctx context.Context, writer io.Writer, po PortOptions) error {
 	containers, err := c.Containers(ctx, po.ServiceName)
 	if err != nil {
-		return fmt.Errorf("fail to get containers for service %s: %s", po.ServiceName, err)
+		return fmt.Errorf("fail to get containers for service %s: %w", po.ServiceName, err)
 	}
 	if len(containers) == 0 {
 		return fmt.Errorf("no running containers from service %s", po.ServiceName)
@@ -48,6 +51,13 @@ func (c *Composer) Port(ctx context.Context, writer io.Writer, po PortOptions) e
 			po.Index, len(containers), po.ServiceName)
 	}
 	container := containers[po.Index-1]
-
-	return containerutil.PrintHostPort(ctx, writer, container, po.Port, po.Protocol)
+	containerLabels, err := container.Labels(ctx)
+	if err != nil {
+		return err
+	}
+	ports, err := portutil.LoadPortMappings(po.DataStore, po.Namespace, container.ID(), containerLabels)
+	if err != nil {
+		return err
+	}
+	return containerutil.PrintHostPort(ctx, writer, container, po.Port, po.Protocol, ports)
 }

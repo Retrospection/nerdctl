@@ -18,6 +18,7 @@ package logging
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -28,30 +29,37 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/containerd/containerd/runtime/v2/logging"
-	"github.com/containerd/nerdctl/pkg/strutil"
 	"github.com/coreos/go-systemd/v22/journal"
 	"github.com/docker/cli/templates"
 	timetypes "github.com/docker/docker/api/types/time"
-	"github.com/sirupsen/logrus"
+
+	"github.com/containerd/containerd/v2/core/runtime/v2/logging"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/clientutil"
+	"github.com/containerd/nerdctl/v2/pkg/containerutil"
+	"github.com/containerd/nerdctl/v2/pkg/strutil"
 )
 
 var JournalDriverLogOpts = []string{
 	Tag,
+	Env,
+	Labels,
 }
 
 func JournalLogOptsValidate(logOptMap map[string]string) error {
 	for key := range logOptMap {
 		if !strutil.InStringSlice(JournalDriverLogOpts, key) {
-			logrus.Warnf("log-opt %s is ignored for journald log driver", key)
+			log.L.Warnf("log-opt %s is ignored for journald log driver", key)
 		}
 	}
 	return nil
 }
 
 type JournaldLogger struct {
-	Opts map[string]string
-	vars map[string]string
+	Opts    map[string]string
+	vars    map[string]string
+	Address string
 }
 
 type identifier struct {
@@ -64,7 +72,7 @@ func (journaldLogger *JournaldLogger) Init(dataStore, ns, id string) error {
 	return nil
 }
 
-func (journaldLogger *JournaldLogger) PreProcess(dataStore string, config *logging.Config) error {
+func (journaldLogger *JournaldLogger) PreProcess(ctx context.Context, dataStore string, config *logging.Config) error {
 	if !journal.Enabled() {
 		return errors.New("the local systemd journal is not available for logging")
 	}
@@ -93,9 +101,37 @@ func (journaldLogger *JournaldLogger) PreProcess(dataStore string, config *loggi
 			syslogIdentifier = b.String()
 		}
 	}
+
+	client, ctx, cancel, err := clientutil.NewClient(ctx, config.Namespace, journaldLogger.Address)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		cancel()
+		client.Close()
+	}()
+	containerID := config.ID
+	container, err := client.LoadContainer(ctx, containerID)
+	if err != nil {
+		return err
+	}
+	containerLabels, err := container.Labels(ctx)
+	if err != nil {
+		return err
+	}
+	containerInfo, err := container.Info(ctx)
+	if err != nil {
+		return err
+	}
+
 	// construct log metadata for the container
 	vars := map[string]string{
 		"SYSLOG_IDENTIFIER": syslogIdentifier,
+		"CONTAINER_TAG":     syslogIdentifier,
+		"CONTAINER_ID":      shortID,
+		"CONTAINER_ID_FULL": containerID,
+		"CONTAINER_NAME":    containerutil.GetContainerName(containerLabels),
+		"IMAGE_NAME":        containerInfo.Image,
 	}
 	journaldLogger.vars = vars
 	return nil
@@ -127,7 +163,7 @@ func (journaldLogger *JournaldLogger) PostProcess() error {
 func FetchLogs(stdout, stderr io.Writer, journalctlArgs []string, stopChannel chan os.Signal) error {
 	journalctl, err := exec.LookPath("journalctl")
 	if err != nil {
-		return fmt.Errorf("could not find `journalctl` executable in PATH: %s", err)
+		return fmt.Errorf("could not find `journalctl` executable in PATH: %w", err)
 	}
 
 	cmd := exec.Command(journalctl, journalctlArgs...)
@@ -135,15 +171,24 @@ func FetchLogs(stdout, stderr io.Writer, journalctlArgs []string, stopChannel ch
 	cmd.Stderr = stderr
 
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start journalctl command with args %#v: %s", journalctlArgs, err)
+		return fmt.Errorf("failed to start journalctl command with args %#v: %w", journalctlArgs, err)
 	}
 
 	// Setup killing goroutine:
+	killed := false
 	go func() {
 		<-stopChannel
-		logrus.Debugf("killing journalctl logs process with PID: %#v", cmd.Process.Pid)
+		killed = true
+		log.L.Debugf("killing journalctl logs process with PID: %#v", cmd.Process.Pid)
 		cmd.Process.Kill()
 	}()
+
+	err = cmd.Wait()
+	if exitError, ok := err.(*exec.ExitError); ok {
+		if !killed && exitError.ExitCode() != 0 {
+			return fmt.Errorf("journalctl command exited with non-zero exit code (%d): %w", exitError.ExitCode(), exitError)
+		}
+	}
 
 	return nil
 }
@@ -172,7 +217,7 @@ func viewLogsJournald(lvopts LogViewOptions, stdout, stderr io.Writer, stopChann
 		journalctlArgs = append(journalctlArgs, "--since", date)
 	}
 	if lvopts.Timestamps {
-		logrus.Warnf("unsupported Timestamps option for journald driver")
+		log.L.Warnf("unsupported Timestamps option for journald driver")
 	}
 	if lvopts.Until != "" {
 		// using GetTimestamp from moby to keep time format consistency

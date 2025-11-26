@@ -17,19 +17,32 @@
 package statsutil
 
 import (
+	"bufio"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 
-	v1 "github.com/containerd/cgroups/stats/v1"
-	v2 "github.com/containerd/cgroups/v2/stats"
 	"github.com/vishvananda/netlink"
+
+	v1 "github.com/containerd/cgroups/v3/cgroup1/stats"
+	v2 "github.com/containerd/cgroups/v3/cgroup2/stats"
 )
 
-func SetCgroupStatsFields(previousStats *ContainerStats, data *v1.Metrics, links []netlink.Link) (StatsEntry, error) {
+func calculateMemPercent(limit float64, usedNo float64) float64 {
+	// Limit will never be 0 unless the container is not running and we haven't
+	// got any data from cgroup
+	if limit != 0 {
+		return usedNo / limit * 100.0
+	}
+	return 0
+}
 
-	cpuPercent := calculateCgroupCPUPercent(previousStats, data)
+func SetCgroupStatsFields(previousStats *ContainerStats, data *v1.Metrics, links []netlink.Link, systemInfo SystemInfo) (StatsEntry, error) {
+	cpuPercent := calculateCgroupCPUPercent(previousStats, data, systemInfo)
 	blkRead, blkWrite := calculateCgroupBlockIO(data)
 	mem := calculateCgroupMemUsage(data)
-	memLimit := float64(data.Memory.Usage.Limit)
+	memLimit := getCgroupMemLimit(float64(data.Memory.Usage.Limit))
 	memPercent := calculateMemPercent(memLimit, mem)
 	pidsStatsCurrent := data.Pids.Current
 	netRx, netTx := calculateCgroupNetwork(links)
@@ -49,11 +62,10 @@ func SetCgroupStatsFields(previousStats *ContainerStats, data *v1.Metrics, links
 }
 
 func SetCgroup2StatsFields(previousStats *ContainerStats, metrics *v2.Metrics, links []netlink.Link) (StatsEntry, error) {
-
 	cpuPercent := calculateCgroup2CPUPercent(previousStats, metrics)
 	blkRead, blkWrite := calculateCgroup2IO(metrics)
 	mem := calculateCgroup2MemUsage(metrics)
-	memLimit := float64(metrics.Memory.UsageLimit)
+	memLimit := getCgroupMemLimit(float64(metrics.Memory.UsageLimit))
 	memPercent := calculateMemPercent(memLimit, mem)
 	pidsStatsCurrent := metrics.Pids.Current
 	netRx, netTx := calculateCgroupNetwork(links)
@@ -72,18 +84,51 @@ func SetCgroup2StatsFields(previousStats *ContainerStats, metrics *v2.Metrics, l
 
 }
 
-func calculateCgroupCPUPercent(previousStats *ContainerStats, metrics *v1.Metrics) float64 {
+func getCgroupMemLimit(memLimit float64) float64 {
+	if memLimit == float64(^uint64(0)) {
+		return getHostMemLimit()
+	}
+	return memLimit
+}
+
+func getHostMemLimit() float64 {
+	file, err := os.Open("/proc/meminfo")
+	if err != nil {
+		return float64(^uint64(0))
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		if strings.HasPrefix(scanner.Text(), "MemTotal:") {
+			fields := strings.Fields(scanner.Text())
+			if len(fields) >= 2 {
+				memKb, err := strconv.ParseUint(fields[1], 10, 64)
+				if err == nil {
+					return float64(memKb * 1024) // kB to bytes
+				}
+			}
+			break
+		}
+	}
+	return float64(^uint64(0))
+}
+
+func calculateCgroupCPUPercent(previousStats *ContainerStats, metrics *v1.Metrics, systemInfo SystemInfo) float64 {
 	var (
 		cpuPercent = 0.0
 		// calculate the change for the cpu usage of the container in between readings
 		cpuDelta = float64(metrics.CPU.Usage.Total) - float64(previousStats.CgroupCPU)
 		// calculate the change for the entire system between readings
-		systemDelta = float64(metrics.CPU.Usage.Kernel) - float64(previousStats.CgroupSystem)
-		onlineCPUs  = float64(len(metrics.CPU.Usage.PerCPU))
+		systemDelta = float64(systemInfo.SystemUsage) - float64(previousStats.CgroupSystem)
+		onlineCPUs  = systemInfo.OnlineCPUs
 	)
 
+	if onlineCPUs == 0 {
+		onlineCPUs = uint32(len(metrics.CPU.Usage.PerCPU))
+	}
 	if systemDelta > 0.0 && cpuDelta > 0.0 {
-		cpuPercent = (cpuDelta / systemDelta) * onlineCPUs * 100.0
+		cpuPercent = (cpuDelta / systemDelta) * float64(onlineCPUs) * 100.0
 	}
 	return cpuPercent
 }

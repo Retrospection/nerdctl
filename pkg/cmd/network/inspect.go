@@ -19,61 +19,96 @@ package network
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
-	"github.com/containerd/nerdctl/pkg/api/types"
-	"github.com/containerd/nerdctl/pkg/formatter"
-	"github.com/containerd/nerdctl/pkg/idutil/netwalker"
-	"github.com/containerd/nerdctl/pkg/inspecttypes/dockercompat"
-	"github.com/containerd/nerdctl/pkg/inspecttypes/native"
-	"github.com/containerd/nerdctl/pkg/netutil"
-	"github.com/sirupsen/logrus"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
+	"github.com/containerd/nerdctl/v2/pkg/containerinspector"
+	"github.com/containerd/nerdctl/v2/pkg/formatter"
+	"github.com/containerd/nerdctl/v2/pkg/inspecttypes/dockercompat"
+	"github.com/containerd/nerdctl/v2/pkg/inspecttypes/native"
+	"github.com/containerd/nerdctl/v2/pkg/labels"
+	"github.com/containerd/nerdctl/v2/pkg/netutil"
 )
 
-func Inspect(ctx context.Context, options types.NetworkInspectOptions) error {
-	globalOptions := options.GOptions
-	e, err := netutil.NewCNIEnv(globalOptions.CNIPath, globalOptions.CNINetConfPath)
-
-	if err != nil {
-		return err
-	}
+func Inspect(ctx context.Context, client *containerd.Client, options types.NetworkInspectOptions) error {
 	if options.Mode != "native" && options.Mode != "dockercompat" {
 		return fmt.Errorf("unknown mode %q", options.Mode)
 	}
 
-	var result []interface{}
-	walker := netwalker.NetworkWalker{
-		Client: e,
-		OnFound: func(ctx context.Context, found netwalker.Found) error {
-			if found.MatchCount > 1 {
-				return fmt.Errorf("multiple IDs found with provided prefix: %s", found.Req)
-			}
-			r := &native.Network{
-				CNI:           json.RawMessage(found.Network.Bytes),
-				NerdctlID:     found.Network.NerdctlID,
-				NerdctlLabels: found.Network.NerdctlLabels,
-				File:          found.Network.File,
-			}
-			switch options.Mode {
-			case "native":
-				result = append(result, r)
-			case "dockercompat":
-				compat, err := dockercompat.NetworkFromNative(r)
-				if err != nil {
-					return err
-				}
-				result = append(result, compat)
-			}
-			return nil
-		},
+	cniEnv, err := netutil.NewCNIEnv(options.GOptions.CNIPath, options.GOptions.CNINetConfPath, netutil.WithNamespace(options.GOptions.Namespace))
+	if err != nil {
+		return err
 	}
 
-	// `network inspect` doesn't support pseudo network.
-	err = walker.WalkAll(ctx, options.Networks, true, false)
-	if len(result) > 0 {
-		if formatErr := formatter.FormatSlice(options.Format, options.Stdout, result); formatErr != nil {
-			logrus.Error(formatErr)
+	var result []interface{}
+	netLists, errs := cniEnv.ListNetworksMatch(options.Networks, true)
+
+	for req, netList := range netLists {
+		if len(netList) > 1 {
+			errs = append(errs, fmt.Errorf("multiple IDs found with provided prefix: %s", req))
+			continue
+		}
+		if len(netList) == 0 {
+			errs = append(errs, fmt.Errorf("no network found matching: %s", req))
+			continue
+		}
+
+		network := netList[0]
+
+		var filters = []string{fmt.Sprintf(`labels.%q~="\\\"%s\\\""`, labels.Networks, network.Name)}
+		filteredContainers, err := client.Containers(ctx, filters...)
+		if err != nil {
+			return err
+		}
+
+		var containers []*native.Container
+		for _, container := range filteredContainers {
+			nativeContainer, err := containerinspector.Inspect(ctx, container)
+			if err != nil {
+				continue
+			}
+			if nativeContainer.Process == nil || nativeContainer.Process.Status.Status != containerd.Running {
+				continue
+			}
+
+			containers = append(containers, nativeContainer)
+		}
+
+		r := &native.Network{
+			CNI:           json.RawMessage(network.Bytes),
+			NerdctlID:     network.NerdctlID,
+			NerdctlLabels: network.NerdctlLabels,
+			File:          network.File,
+			Containers:    containers,
+		}
+		switch options.Mode {
+		case "native":
+			result = append(result, r)
+		case "dockercompat":
+			compat, err := dockercompat.NetworkFromNative(r)
+			if err != nil {
+				return err
+			}
+			result = append(result, compat)
 		}
 	}
+
+	if len(result) > 0 {
+		if formatErr := formatter.FormatSlice(options.Format, options.Stdout, result); formatErr != nil {
+			log.G(ctx).Error(formatErr)
+		}
+		err = nil
+	} else {
+		err = errors.New("unable to find any network matching the provided request")
+	}
+
+	for _, unErr := range errs {
+		log.G(ctx).Error(unErr)
+	}
+
 	return err
 }

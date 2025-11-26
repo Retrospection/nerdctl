@@ -12,6 +12,18 @@ the [fulcio](https://github.com/sigstore/fulcio) root CA. Signatures are stored 
 the [rekor](https://github.com/sigstore/rekor) transparency log, which automatically provides an attestation as to when
 the signature was created.
 
+Cosign would use prompt to confirm the statement below during `sign`. Nerdctl added `--yes` to Cosign command, which says yes and prevents this prompt.
+Using Nerdctl push with signing by Cosign means that users agree the statement.
+
+
+```
+Note that there may be personally identifiable information associated with this signed artifact.
+This may include the email address associated with the account with which you authenticate.
+This information will be used for signing this artifact and will be stored in public transparency logs and cannot be removed later.
+
+By typing 'y', you attest that you grant (or have permission to grant) and agree to have this information stored permanently in transparency logs.
+```
+
 You can enable container signing and verifying features with `push` and `pull` commands of `nerdctl` by using `cosign`
 under the hood with make use of flags `--sign` while pushing the container image, and `--verify` while pulling the
 container image.
@@ -58,9 +70,11 @@ Verify the container image while pulling:
 
 > REMINDER: Image won't be pulled if there are no matching signatures in case you passed `--verify` flag.
 
+> REMINDER: For keyless flows to work, you need to set either --cosign-certificate-identity or --cosign-certificate-identity-regexp, and either --cosign-certificate-oidc-issuer or --cosign-certificate-oidc-issuer-regexp. The OIDC issuer expected in a valid Fulcio certificate for --verify=cosign, e.g. https://token.actions.githubusercontent.com or https://oauth2.sigstore.dev/auth.
+
 ```shell
 # Verify the image with Keyless mode
-$ nerdctl pull --verify=cosign devopps/hello-world
+$ nerdctl pull --verify=cosign --certificate-identity=name@example.com --certificate-oidc-issuer=https://accounts.example.com devopps/hello-world
 INFO[0004] cosign:
 INFO[0004] cosign: [{"critical":{"identity":...}]
 docker.io/devopps/nginx-new:latest:                                               resolved       |++++++++++++++++++++++++++++++++++++++|
@@ -131,6 +145,26 @@ services:
     x-nerdctl-cosign-public-key: ./cosign.pub
     x-nerdctl-sign: cosign
     x-nerdctl-cosign-private-key: ./cosign.key
+    ports:
+    - 8080:80
+  svc1:
+    build: .
+    image: ${REGISTRY}/svc1_image # replace with your registry
+    ports:
+    - 8081:80
+```
+
+For keyless mode, the `docker-compose.yaml` will be:
+```
+$ cat docker-compose.yml
+services:
+  svc0:
+    build: .
+    image: ${REGISTRY}/svc1_image # replace with your registry
+    x-nerdctl-verify: cosign
+    x-nerdctl-sign: cosign
+    x-nerdctl-cosign-certificate-identity: name@example.com # or x-nerdctl-cosign-certificate-identity-regexp
+    x-nerdctl-cosign-certificate-oidc-issuer: https://accounts.example.com # or x-nerdctl-cosign-certificate-oidc-issuer-regexp
     ports:
     - 8080:80
   svc1:

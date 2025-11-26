@@ -16,7 +16,11 @@
 
 package types
 
-import "io"
+import (
+	"io"
+
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+)
 
 // ImageListOptions specifies options for `nerdctl image list`.
 type ImageListOptions struct {
@@ -63,7 +67,17 @@ type ImageConvertOptions struct {
 	// Format the output using the given Go template, e.g, 'json'
 	Format string
 
-	// #region estargz flags
+	// Embed image format options
+	EstargzOptions
+	ZstdOptions
+	ZstdChunkedOptions
+	NydusOptions
+	OverlaybdOptions
+	SociConvertOptions
+}
+
+// EstargzOptions contains eStargz conversion options
+type EstargzOptions struct {
 	// Estargz convert legacy tar(.gz) layers to eStargz for lazy pulling. Should be used in conjunction with '--oci'
 	Estargz bool
 	// EstargzRecordIn read 'ctr-remote optimize --record-out=<FILE>' record file (EXPERIMENTAL)
@@ -78,9 +92,20 @@ type ImageConvertOptions struct {
 	EstargzExternalToc bool
 	// EstargzKeepDiffID convert to esgz without changing diffID (cannot be used in conjunction with '--estargz-record-in'. must be specified with '--estargz-external-toc')
 	EstargzKeepDiffID bool
-	// #endregion
+	// EstargzGzipHelper helper command for decompressing layers compressed with gzip. Options: pigz, igzip, or gzip
+	EstargzGzipHelper string
+}
 
-	// #region zstd:chunked flags
+// ZstdOptions contains zstd conversion options
+type ZstdOptions struct {
+	// Zstd convert legacy tar(.gz) layers to zstd. Should be used in conjunction with '--oci'
+	Zstd bool
+	// ZstdCompressionLevel zstd compression level
+	ZstdCompressionLevel int
+}
+
+// ZstdChunkedOptions contains zstd:chunked conversion options
+type ZstdChunkedOptions struct {
 	// ZstdChunked convert legacy tar(.gz) layers to zstd:chunked for lazy pulling. Should be used in conjunction with '--oci'
 	ZstdChunked bool
 	// ZstdChunkedCompressionLevel zstd compression level
@@ -89,9 +114,10 @@ type ImageConvertOptions struct {
 	ZstdChunkedChunkSize int
 	// ZstdChunkedRecordIn read 'ctr-remote optimize --record-out=<FILE>' record file (EXPERIMENTAL)
 	ZstdChunkedRecordIn string
-	// #endregion
+}
 
-	// #region nydus flags
+// NydusOptions contains nydus conversion options
+type NydusOptions struct {
 	// Nydus convert legacy tar(.gz) layers to nydus for lazy pulling. Should be used in conjunction with '--oci'
 	Nydus bool
 	// NydusBuilderPath the nydus-image binary path, if unset, search in PATH environment
@@ -102,9 +128,10 @@ type ImageConvertOptions struct {
 	NydusPrefetchPatterns string
 	// NydusCompressor nydus blob compression algorithm, possible values: `none`, `lz4_block`, `zstd`, default is `lz4_block`
 	NydusCompressor string
-	// #endregion
+}
 
-	// #region overlaybd flags
+// OverlaybdOptions contains overlaybd conversion options
+type OverlaybdOptions struct {
 	// Overlaybd convert tar.gz layers to overlaybd layers
 	Overlaybd bool
 	// OverlayFsType filesystem type for overlaybd
@@ -112,7 +139,14 @@ type ImageConvertOptions struct {
 	// OverlaydbDBStr database config string for overlaybd
 	OverlaydbDBStr string
 	// #endregion
+}
 
+type SociConvertOptions struct {
+	// Soci convert image to SOCI format.
+	Soci bool
+	// SociOptions contains SOCI-specific options
+	SociOptions SociOptions
+	// #endregion
 }
 
 // ImageCryptOptions specifies options for `nerdctl image encrypt` and `nerdctl image decrypt`.
@@ -149,8 +183,10 @@ type ImageInspectOptions struct {
 
 // ImagePushOptions specifies options for `nerdctl (image) push`.
 type ImagePushOptions struct {
-	Stdout   io.Writer
-	GOptions GlobalCommandOptions
+	Stdout      io.Writer
+	GOptions    GlobalCommandOptions
+	SignOptions ImageSignOptions
+	SociOptions SociOptions
 	// Platforms convert content for a specific platform
 	Platforms []string
 	// AllPlatforms convert content for all platforms
@@ -162,33 +198,40 @@ type ImagePushOptions struct {
 	IpfsEnsureImage bool
 	// IpfsAddress multiaddr of IPFS API (default uses $IPFS_PATH env variable if defined or local directory ~/.ipfs)
 	IpfsAddress string
-	// Sign the image (none|cosign)
-	Sign string
-	// CosignKey Path to the private key file, KMS URI or Kubernetes Secret for --sign=cosign
-	CosignKey string
+	// Suppress verbose output
+	Quiet bool
 	// AllowNondistributableArtifacts allow pushing non-distributable artifacts
 	AllowNondistributableArtifacts bool
 }
 
+// RemoteSnapshotterFlags are used for pulling with remote snapshotters
+// e.g. SOCI, stargz, overlaybd
+type RemoteSnapshotterFlags struct {
+	SociIndexDigest string
+}
+
 // ImagePullOptions specifies options for `nerdctl (image) pull`.
 type ImagePullOptions struct {
-	Stdout   io.Writer
-	Stderr   io.Writer
-	GOptions GlobalCommandOptions
-	// Unpack the image for the current single platform (auto/true/false)
-	Unpack string
-	// Pull content for a specific platform
-	Platform []string
-	// Pull content for all platforms
-	AllPlatforms bool
-	// Verify the image (none|cosign)
-	Verify string
-	// Path to the public key file, KMS, URI or Kubernetes Secret for --verify=cosign
-	CosignKey string
+	Stdout io.Writer
+	Stderr io.Writer
+	// ProgressOutputToStdout directs progress output to stdout instead of stderr
+	ProgressOutputToStdout bool
+
+	GOptions      GlobalCommandOptions
+	VerifyOptions ImageVerifyOptions
+	// Unpack the image for the current single platform.
+	// If nil, it will unpack automatically if only 1 platform is specified.
+	Unpack *bool
+	// Content for specific platforms. Empty if `--all-platforms` is true
+	OCISpecPlatform []ocispec.Platform
+	// Pull mode
+	Mode string
 	// Suppress verbose output
 	Quiet bool
 	// multiaddr of IPFS API (default uses $IPFS_PATH env variable if defined or local directory ~/.ipfs)
 	IPFSAddress string
+	// Flags to pass into remote snapshotters
+	RFlags RemoteSnapshotterFlags
 }
 
 // ImageTagOptions specifies options for `nerdctl (image) tag`.
@@ -219,6 +262,8 @@ type ImagePruneOptions struct {
 	GOptions GlobalCommandOptions
 	// All Remove all unused images, not just dangling ones.
 	All bool
+	// Filters output based on conditions provided for the --filter argument
+	Filters []string
 	// Force will not prompt for confirmation.
 	Force bool
 }
@@ -231,4 +276,44 @@ type ImageSaveOptions struct {
 	AllPlatforms bool
 	// Export content for a specific platform
 	Platform []string
+}
+
+// ImageSignOptions contains options for signing an image. It contains options from
+// all providers. The `provider` field determines which provider is used.
+type ImageSignOptions struct {
+	// Provider used to sign the image (none|cosign|notation)
+	Provider string
+	// CosignKey Path to the private key file, KMS URI or Kubernetes Secret for --sign=cosign
+	CosignKey string
+	// NotationKeyName Signing key name for a key previously added to notation's key list for --sign=notation
+	NotationKeyName string
+}
+
+// ImageVerifyOptions contains options for verifying an image. It contains options from
+// all providers. The `provider` field determines which provider is used.
+type ImageVerifyOptions struct {
+	// Provider used to verify the image (none|cosign|notation)
+	Provider string
+	// CosignKey Path to the public key file, KMS URI or Kubernetes Secret for --verify=cosign
+	CosignKey string
+	// CosignCertificateIdentity The identity expected in a valid Fulcio certificate for --verify=cosign. Valid values include email address, DNS names, IP addresses, and URIs. Either --cosign-certificate-identity or --cosign-certificate-identity-regexp must be set for keyless flows
+	CosignCertificateIdentity string
+	// CosignCertificateIdentityRegexp A regular expression alternative to --cosign-certificate-identity for --verify=cosign. Accepts the Go regular expression syntax described at https://golang.org/s/re2syntax. Either --cosign-certificate-identity or --cosign-certificate-identity-regexp must be set for keyless flows
+	CosignCertificateIdentityRegexp string
+	// CosignCertificateOidcIssuer The OIDC issuer expected in a valid Fulcio certificate for --verify=cosign, e.g. https://token.actions.githubusercontent.com or https://oauth2.sigstore.dev/auth. Either --cosign-certificate-oidc-issuer or --cosign-certificate-oidc-issuer-regexp must be set for keyless flows
+	CosignCertificateOidcIssuer string
+	// CosignCertificateOidcIssuerRegexp A regular expression alternative to --certificate-oidc-issuer for --verify=cosign. Accepts the Go regular expression syntax described at https://golang.org/s/re2syntax. Either --cosign-certificate-oidc-issuer or --cosign-certificate-oidc-issuer-regexp must be set for keyless flows
+	CosignCertificateOidcIssuerRegexp string
+}
+
+// SociOptions contains options for SOCI.
+type SociOptions struct {
+	// Span size that soci index uses to segment layer data. Default is 4 MiB.
+	SpanSize int64
+	// Minimum layer size to build zTOC for. Smaller layers won't have zTOC and not lazy pulled. Default is 10 MiB.
+	MinLayerSize int64
+	// Platforms convert content for a specific platform
+	Platforms []string
+	// AllPlatforms convert content for all platforms
+	AllPlatforms bool
 }

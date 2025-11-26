@@ -35,7 +35,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/internal/filesystem"
 )
 
 const (
@@ -70,7 +72,7 @@ var (
 // More information at https://www.freedesktop.org/software/systemd/man/systemd-resolved.service.html#/etc/resolv.conf
 func Path() string {
 	detectSystemdResolvConfOnce.Do(func() {
-		candidateResolvConf, err := os.ReadFile(defaultPath)
+		candidateResolvConf, err := filesystem.ReadFile(defaultPath)
 		if err != nil {
 			// silencing error as it will resurface at next calls trying to read defaultPath
 			return
@@ -78,7 +80,7 @@ func Path() string {
 		ns := GetNameservers(candidateResolvConf, IP)
 		if len(ns) == 1 && ns[0] == "127.0.0.53" {
 			pathAfterSystemdDetection = alternatePath
-			logrus.Debugf("detected 127.0.0.53 nameserver, assuming systemd-resolved, so using resolv.conf: %s", alternatePath)
+			log.L.Debugf("detected 127.0.0.53 nameserver, assuming systemd-resolved, so using resolv.conf: %s", alternatePath)
 		}
 	})
 	return pathAfterSystemdDetection
@@ -131,7 +133,7 @@ func Get() (*File, error) {
 
 // GetSpecific returns the contents of the user specified resolv.conf file and its hash
 func GetSpecific(path string) (*File, error) {
-	resolv, err := os.ReadFile(path)
+	resolv, err := filesystem.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
@@ -149,7 +151,7 @@ func GetIfChanged() (*File, error) {
 	lastModified.Lock()
 	defer lastModified.Unlock()
 
-	resolv, err := os.ReadFile(Path())
+	resolv, err := filesystem.ReadFile(Path())
 	if err != nil {
 		return nil, err
 	}
@@ -190,10 +192,10 @@ func FilterResolvDNS(resolvConf []byte, ipv6Enabled bool) (*File, error) {
 	// if the resulting resolvConf has no more nameservers defined, add appropriate
 	// default DNS servers for IPv4 and (optionally) IPv6
 	if len(GetNameservers(cleanedResolvConf, IP)) == 0 {
-		logrus.Infof("No non-localhost DNS nameservers are left in resolv.conf. Using default external servers: %v", defaultIPv4Dns)
+		log.L.Infof("No non-localhost DNS nameservers are left in resolv.conf. Using default external servers: %v", defaultIPv4Dns)
 		dns := defaultIPv4Dns
 		if ipv6Enabled {
-			logrus.Infof("IPv6 enabled; Adding default IPv6 external servers: %v", defaultIPv6Dns)
+			log.L.Infof("IPv6 enabled; Adding default IPv6 external servers: %v", defaultIPv6Dns)
 			dns = append(dns, defaultIPv6Dns...)
 		}
 		cleanedResolvConf = append(cleanedResolvConf, []byte("\n"+strings.Join(dns, "\n"))...)
@@ -317,7 +319,16 @@ func Build(path string, dns, dnsSearch, dnsOptions []string) (*File, error) {
 		return nil, err
 	}
 
-	return &File{Content: content.Bytes(), Hash: hash}, os.WriteFile(path, content.Bytes(), 0644)
+	err = filesystem.WriteFile(path, content.Bytes(), 0o644)
+	if err != nil {
+		return nil, err
+	}
+
+	// WriteFile relies on syscall.Open. Unless there are ACLs, the effective mode of the file will be matched
+	// against the current process umask.
+	// See https://www.man7.org/linux/man-pages/man2/open.2.html for details.
+	// Since we must make sure that these files are world readable, explicitly chmod them here.
+	return &File{Content: content.Bytes(), Hash: hash}, os.Chmod(path, 0o644)
 }
 
 func hashData(src io.Reader) (string, error) {

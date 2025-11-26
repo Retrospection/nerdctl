@@ -17,11 +17,13 @@
 package serviceparser
 
 import (
+	"runtime"
+	"strings"
 	"testing"
 
-	"github.com/containerd/nerdctl/pkg/composer/projectloader"
-	"github.com/containerd/nerdctl/pkg/testutil"
 	"gotest.tools/v3/assert"
+
+	"github.com/containerd/nerdctl/v2/pkg/testutil"
 )
 
 func lastOf(ss []string) string {
@@ -30,6 +32,11 @@ func lastOf(ss []string) string {
 
 func TestParseBuild(t *testing.T) {
 	t.Parallel()
+
+	if runtime.GOOS == "windows" {
+		t.Skip("test is not compatible with windows")
+	}
+
 	const dockerComposeYAML = `
 services:
   foo:
@@ -43,11 +50,29 @@ services:
       target: bartgt
       labels:
         bar: baz
+      secrets:
+        - source: src_secret
+          target: tgt_secret
+        - simple_secret
+        - absolute_secret
+  baz:
+    image: bazimg
+    build:
+      context: ./bazctx
+      dockerfile_inline: |
+       FROM random
+secrets:
+  src_secret:
+    file: test_secret1
+  simple_secret:
+    file: test_secret2
+  absolute_secret:
+    file: /tmp/absolute_secret
 `
 	comp := testutil.NewComposeDir(t, dockerComposeYAML)
 	defer comp.CleanUp()
 
-	project, err := projectloader.Load(comp.YAMLFullPath(), comp.ProjectName(), nil)
+	project, err := testutil.LoadProject(comp.YAMLFullPath(), comp.ProjectName(), nil)
 	assert.NilError(t, err)
 
 	fooSvc, err := project.GetService("foo")
@@ -57,7 +82,7 @@ services:
 	assert.NilError(t, err)
 
 	t.Logf("foo: %+v", foo)
-	assert.Equal(t, project.Name+"_foo", foo.Image)
+	assert.Equal(t, DefaultImageName(project.Name, "foo"), foo.Image)
 	assert.Equal(t, false, foo.Build.Force)
 	assert.Equal(t, project.RelativePath("fooctx"), lastOf(foo.Build.BuildArgs))
 
@@ -67,10 +92,27 @@ services:
 	bar, err := Parse(project, barSvc)
 	assert.NilError(t, err)
 
-	t.Logf("bar: %+v", foo)
+	t.Logf("bar: %+v", bar)
 	assert.Equal(t, "barimg", bar.Image)
 	assert.Equal(t, true, bar.Build.Force)
 	assert.Equal(t, project.RelativePath("barctx"), lastOf(bar.Build.BuildArgs))
 	assert.Assert(t, in(bar.Build.BuildArgs, "--target=bartgt"))
 	assert.Assert(t, in(bar.Build.BuildArgs, "--label=bar=baz"))
+	secretPath := project.WorkingDir
+	assert.Assert(t, in(bar.Build.BuildArgs, "--secret=id=tgt_secret,src="+secretPath+"/test_secret1"))
+	assert.Assert(t, in(bar.Build.BuildArgs, "--secret=id=simple_secret,src="+secretPath+"/test_secret2"))
+	assert.Assert(t, in(bar.Build.BuildArgs, "--secret=id=absolute_secret,src=/tmp/absolute_secret"))
+
+	bazSvc, err := project.GetService("baz")
+	assert.NilError(t, err)
+
+	baz, err := Parse(project, bazSvc)
+	assert.NilError(t, err)
+
+	t.Logf("baz: %+v", baz)
+	t.Logf("baz.Build.BuildArgs: %+v", baz.Build.BuildArgs)
+	t.Logf("baz.Build.DockerfileInline: %q", baz.Build.DockerfileInline)
+	assert.Assert(t, func() bool {
+		return strings.TrimSpace(baz.Build.DockerfileInline) == "FROM random"
+	}())
 }

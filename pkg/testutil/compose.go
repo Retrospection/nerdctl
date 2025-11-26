@@ -17,20 +17,29 @@
 package testutil
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
-	"testing"
+
+	"github.com/compose-spec/compose-go/v2/loader"
+	compose "github.com/compose-spec/compose-go/v2/types"
+
+	"github.com/containerd/nerdctl/mod/tigron/tig"
+
+	"github.com/containerd/nerdctl/v2/pkg/internal/filesystem"
 )
 
 type ComposeDir struct {
-	t            testing.TB
+	t            tig.T
 	dir          string
 	yamlBasePath string
 }
 
 func (cd *ComposeDir) WriteFile(name, content string) {
-	if err := os.WriteFile(filepath.Join(cd.dir, name), []byte(content), 0644); err != nil {
-		cd.t.Fatal(err)
+	if err := filesystem.WriteFile(filepath.Join(cd.dir, name), []byte(content), 0644); err != nil {
+		cd.t.Log(fmt.Sprintf("Failed to create file %v", err))
+		cd.t.FailNow()
 	}
 }
 
@@ -50,10 +59,11 @@ func (cd *ComposeDir) CleanUp() {
 	os.RemoveAll(cd.dir)
 }
 
-func NewComposeDir(t testing.TB, dockerComposeYAML string) *ComposeDir {
+func NewComposeDir(t tig.T, dockerComposeYAML string) *ComposeDir {
 	tmpDir, err := os.MkdirTemp("", "nerdctl-compose-test")
 	if err != nil {
-		t.Fatal(err)
+		t.Log(fmt.Sprintf("Failed to create temp dir: %v", err))
+		t.FailNow()
 	}
 	cd := &ComposeDir{
 		t:            t,
@@ -62,4 +72,33 @@ func NewComposeDir(t testing.TB, dockerComposeYAML string) *ComposeDir {
 	}
 	cd.WriteFile(cd.yamlBasePath, dockerComposeYAML)
 	return cd
+}
+
+// Load is used only for unit testing.
+func LoadProject(fileName, projectName string, envMap map[string]string) (*compose.Project, error) {
+	if envMap == nil {
+		envMap = make(map[string]string)
+	}
+	b, err := filesystem.ReadFile(fileName)
+	if err != nil {
+		return nil, err
+	}
+
+	wd, err := filepath.Abs(filepath.Dir(fileName))
+	if err != nil {
+		return nil, err
+	}
+	var files []compose.ConfigFile
+	files = append(files, compose.ConfigFile{Filename: fileName, Content: b})
+	return loader.LoadWithContext(context.TODO(), compose.ConfigDetails{
+		WorkingDir:  wd,
+		ConfigFiles: files,
+		Environment: envMap,
+	}, withProjectName(projectName))
+}
+
+func withProjectName(name string) func(*loader.Options) {
+	return func(lOpts *loader.Options) {
+		lOpts.SetProjectName(name, true)
+	}
 }

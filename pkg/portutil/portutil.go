@@ -22,34 +22,36 @@ import (
 	"net"
 	"strings"
 
-	gocni "github.com/containerd/go-cni"
-	"github.com/containerd/nerdctl/pkg/labels"
-	"github.com/containerd/nerdctl/pkg/rootlessutil"
 	"github.com/docker/go-connections/nat"
-	"github.com/sirupsen/logrus"
+
+	"github.com/containerd/go-cni"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/labels"
+	"github.com/containerd/nerdctl/v2/pkg/netutil/networkstore"
+	"github.com/containerd/nerdctl/v2/pkg/rootlessutil"
 )
 
 // return respectively ip, hostPort, containerPort
 func splitParts(rawport string) (string, string, string) {
-	parts := strings.Split(rawport, ":")
-	n := len(parts)
-	containerport := parts[n-1]
-
-	switch n {
-	case 1:
-		return "", "", containerport
-	case 2:
-		return "", parts[0], containerport
-	case 3:
-		return parts[0], parts[1], containerport
-	default:
-		return strings.Join(parts[:n-2], ":"), parts[n-2], containerport
+	lastIndex := strings.LastIndex(rawport, ":")
+	containerPort := rawport[lastIndex+1:]
+	if lastIndex == -1 {
+		return "", "", containerPort
 	}
+
+	hostAddrPort := rawport[:lastIndex]
+	addr, port, err := net.SplitHostPort(hostAddrPort)
+	if err != nil {
+		return "", hostAddrPort, containerPort
+	}
+
+	return addr, port, containerPort
 }
 
 // ParseFlagP parse port mapping pair, like "127.0.0.1:3000:8080/tcp",
 // "127.0.0.1:3000-3001:8080-8081/tcp" and "3000:8080" ...
-func ParseFlagP(s string) ([]gocni.PortMapping, error) {
+func ParseFlagP(s string) ([]cni.PortMapping, error) {
 	proto := "tcp"
 	splitBySlash := strings.Split(s, "/")
 	switch len(splitBySlash) {
@@ -66,11 +68,11 @@ func ParseFlagP(s string) ([]gocni.PortMapping, error) {
 		return nil, fmt.Errorf("failed to parse %q, unexpected slashes", s)
 	}
 
-	res := gocni.PortMapping{
+	res := cni.PortMapping{
 		Protocol: proto,
 	}
 
-	mr := []gocni.PortMapping{}
+	mr := []cni.PortMapping{}
 
 	ip, hostPort, containerPort := splitParts(splitBySlash[0])
 
@@ -94,11 +96,21 @@ func ParseFlagP(s string) ([]gocni.PortMapping, error) {
 		if err != nil {
 			return nil, err
 		}
-		logrus.Debugf("There is no hostPort has been spec in command, the auto allocate port is from %d:%d to %d:%d", startHostPort, startPort, endHostPort, endPort)
+		log.L.Debugf("There is no hostPort has been spec in command, the auto allocate port is from %d:%d to %d:%d", startHostPort, startPort, endHostPort, endPort)
 	} else {
 		startHostPort, endHostPort, err = nat.ParsePortRange(hostPort)
 		if err != nil {
 			return nil, fmt.Errorf("invalid hostPort: %s", hostPort)
+		}
+		var usedPorts map[uint64]bool
+		usedPorts, err = getUsedPorts(ip, proto)
+		if err != nil {
+			return nil, err
+		}
+		for i := startHostPort; i <= endHostPort; i++ {
+			if usedPorts[i] {
+				return nil, fmt.Errorf("bind for %s:%d failed: port is already allocated", ip, i)
+			}
 		}
 	}
 	if hostPort != "" && (endPort-startPort) != (endHostPort-startHostPort) {
@@ -128,16 +140,35 @@ func ParseFlagP(s string) ([]gocni.PortMapping, error) {
 	return mr, nil
 }
 
-// ParsePortsLabel parses JSON-marshalled string from label map
-// (under `labels.Ports` key) and returns []gocni.PortMapping.
-func ParsePortsLabel(labelMap map[string]string) ([]gocni.PortMapping, error) {
-	portsJSON := labelMap[labels.Ports]
+func StoreNetworkConfig(dataStore, namespace, id string, netConf networkstore.NetworkConfig) error {
+	ns, err := networkstore.New(dataStore, namespace, id)
+	if err != nil {
+		return err
+	}
+	return ns.Acquire(netConf)
+}
+
+func LoadPortMappings(dataStore, namespace, id string, containerLabels map[string]string) ([]cni.PortMapping, error) {
+	var ports []cni.PortMapping
+
+	ns, err := networkstore.New(dataStore, namespace, id)
+	if err != nil {
+		return ports, err
+	}
+	if err = ns.Load(); err != nil {
+		return ports, err
+	}
+	if len(ns.NetConf.PortMappings) != 0 {
+		return ns.NetConf.PortMappings, nil
+	}
+
+	portsJSON := containerLabels[labels.Ports]
 	if portsJSON == "" {
-		return []gocni.PortMapping{}, nil
+		return ports, nil
 	}
-	var ports []gocni.PortMapping
 	if err := json.Unmarshal([]byte(portsJSON), &ports); err != nil {
-		return nil, fmt.Errorf("failed to parse label %q=%q: %s", labels.Ports, portsJSON, err.Error())
+		return ports, fmt.Errorf("failed to parse label %q=%q: %s", labels.Ports, portsJSON, err.Error())
 	}
+	log.L.Warnf("container %s (%s) is using legacy port mapping configuration. To ensure compatibility with the new port mapping logic, please recreate this container. For more details, see: https://github.com/containerd/nerdctl/pull/4290", containerLabels[labels.Name], id[:12])
 	return ports, nil
 }

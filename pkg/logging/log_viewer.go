@@ -23,8 +23,9 @@ import (
 	"os/exec"
 	"path/filepath"
 
-	"github.com/containerd/nerdctl/pkg/labels/k8slabels"
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/labels/k8slabels"
 )
 
 // Type alias for functions which write out logs to the provided stdout/stderr Writers.
@@ -37,7 +38,7 @@ var logViewers = make(map[string]LogViewerFunc)
 // Registers a LogViewerFunc for the
 func RegisterLogViewer(driverName string, lvfn LogViewerFunc) {
 	if v, ok := logViewers[driverName]; ok {
-		logrus.Warnf("A LogViewerFunc with name %q has already been registered: %#v, overriding with %#v either way", driverName, v, lvfn)
+		log.L.Warnf("A LogViewerFunc with name %q has already been registered: %#v, overriding with %#v either way", driverName, v, lvfn)
 	}
 	logViewers[driverName] = lvfn
 }
@@ -81,6 +82,12 @@ type LogViewOptions struct {
 	// Start/end timestampts to filter logs by.
 	Since string
 	Until string
+
+	// Details enables showing extra details(env and label) in logs.
+	Details bool
+
+	// DetailPrefix is the prefix added when Details is enabled.
+	DetailPrefix *string
 }
 
 func (lvo *LogViewOptions) Validate() error {
@@ -93,7 +100,7 @@ func (lvo *LogViewOptions) Validate() error {
 		if err != nil {
 			return err
 		}
-		logrus.Warnf("given relative datastore path %q, transformed it to absolute path: %q", lvo.DatastoreRootPath, abs)
+		log.L.Warnf("given relative datastore path %q, transformed it to absolute path: %q", lvo.DatastoreRootPath, abs)
 		lvo.DatastoreRootPath = abs
 	}
 
@@ -121,17 +128,21 @@ func InitContainerLogViewer(containerLabels map[string]string, lvopts LogViewOpt
 		lcfg.Driver = "cri"
 	} else {
 		if err := lvopts.Validate(); err != nil {
-			return nil, fmt.Errorf("invalid LogViewOptions provided (%#v): %s", lvopts, err)
+			return nil, fmt.Errorf("invalid LogViewOptions provided (%#v): %w", lvopts, err)
 		}
 
 		lcfg, err = LoadLogConfig(lvopts.DatastoreRootPath, lvopts.Namespace, lvopts.ContainerID)
 		if err != nil {
-			return nil, fmt.Errorf("failed to load logging config: %s", err)
+			return nil, fmt.Errorf("failed to load logging config: %w", err)
 		}
 	}
 
 	if lcfg.Driver == "cri" && !experimental {
 		return nil, fmt.Errorf("the `cri` log viewer requires nerdctl to be running in experimental mode")
+	}
+
+	if lcfg.Driver == "none" {
+		return nil, fmt.Errorf("log type `none` was selected, nothing to log")
 	}
 
 	lv := &ContainerLogViewer{
@@ -145,6 +156,14 @@ func InitContainerLogViewer(containerLabels map[string]string, lvopts LogViewOpt
 
 // Prints all logs for this LogViewer's containers to the provided io.Writers.
 func (lv *ContainerLogViewer) PrintLogsTo(stdout, stderr io.Writer) error {
+	if lv.logViewingOptions.Details {
+		if lv.logViewingOptions.DetailPrefix != nil {
+			prefix := *lv.logViewingOptions.DetailPrefix + " "
+			stdout = NewDetailWriter(stdout, prefix)
+			stderr = NewDetailWriter(stderr, prefix)
+		}
+
+	}
 	viewerFunc, err := getLogViewer(lv.loggingConfig.Driver)
 	if err != nil {
 		return err

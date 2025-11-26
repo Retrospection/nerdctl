@@ -1,9 +1,10 @@
 # artifacts
 /nerdctl
 _output
+*.gomodjail
 
 # golangci-lint
-build
+/build
 
 # vagrant
 /.vagrant

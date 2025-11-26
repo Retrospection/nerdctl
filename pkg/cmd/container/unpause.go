@@ -20,10 +20,12 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/nerdctl/pkg/api/types"
-	"github.com/containerd/nerdctl/pkg/containerutil"
-	"github.com/containerd/nerdctl/pkg/idutil/containerwalker"
+	containerd "github.com/containerd/containerd/v2/client"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
+	"github.com/containerd/nerdctl/v2/pkg/config"
+	"github.com/containerd/nerdctl/v2/pkg/containerutil"
+	"github.com/containerd/nerdctl/v2/pkg/idutil/containerwalker"
 )
 
 // Unpause unpauses all containers specified by `reqs`.
@@ -34,11 +36,11 @@ func Unpause(ctx context.Context, client *containerd.Client, reqs []string, opti
 			if found.MatchCount > 1 {
 				return fmt.Errorf("multiple IDs found with provided prefix: %s", found.Req)
 			}
-			if err := containerutil.Unpause(ctx, client, found.Container.ID()); err != nil {
+			if err := containerutil.Unpause(ctx, client, found.Container.ID(), (*config.Config)(&options.GOptions), options.NerdctlCmd, options.NerdctlArgs); err != nil {
 				return err
 			}
 
-			_, err := fmt.Fprintf(options.Stdout, "%s\n", found.Req)
+			_, err := fmt.Fprintln(options.Stdout, found.Req)
 			return err
 		},
 	}

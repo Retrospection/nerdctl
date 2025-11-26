@@ -18,15 +18,18 @@ package infoutil
 
 import (
 	"fmt"
+	"runtime"
 	"strings"
 
-	"github.com/containerd/cgroups"
-	"github.com/containerd/nerdctl/pkg/apparmorutil"
-	"github.com/containerd/nerdctl/pkg/defaults"
-	"github.com/containerd/nerdctl/pkg/inspecttypes/dockercompat"
-	"github.com/containerd/nerdctl/pkg/rootlessutil"
+	"github.com/docker/docker/pkg/meminfo"
 	"github.com/docker/docker/pkg/sysinfo"
-	"github.com/docker/docker/pkg/system"
+
+	"github.com/containerd/cgroups/v3"
+
+	"github.com/containerd/nerdctl/v2/pkg/apparmorutil"
+	"github.com/containerd/nerdctl/v2/pkg/defaults"
+	"github.com/containerd/nerdctl/v2/pkg/inspecttypes/dockercompat"
+	"github.com/containerd/nerdctl/v2/pkg/rootlessutil"
 )
 
 const UnameO = "GNU/Linux"
@@ -49,7 +52,7 @@ WARNING: AppArmor profile %q is not loaded.
          This warning is negligible if you do not intend to use AppArmor.`), defaults.AppArmorProfileName))
 		}
 	}
-	info.SecurityOptions = append(info.SecurityOptions, "name=seccomp,profile=default")
+	info.SecurityOptions = append(info.SecurityOptions, "name=seccomp,profile="+defaults.SeccompProfileName)
 	if defaults.CgroupnsMode() == "private" {
 		info.SecurityOptions = append(info.SecurityOptions, "name=cgroupns")
 	}
@@ -111,16 +114,20 @@ func fulfillPlatformInfo(info *dockercompat.Info) {
 	if !info.IPv4Forwarding {
 		info.Warnings = append(info.Warnings, "WARNING: IPv4 forwarding is disabled")
 	}
-	info.BridgeNfIptables = !mobySysInfo.BridgeNFCallIPTablesDisabled
+	// FIXME: BridgeNFCallIP6TablesDisabled is deprecated in moby and always false now
+	// Figure out what we want to do with this
+	info.BridgeNfIptables = true // !mobySysInfo.BridgeNFCallIPTablesDisabled
 	if !info.BridgeNfIptables {
 		info.Warnings = append(info.Warnings, "WARNING: bridge-nf-call-iptables is disabled")
 	}
-	info.BridgeNfIP6tables = !mobySysInfo.BridgeNFCallIP6TablesDisabled
+	// FIXME: BridgeNFCallIP6TablesDisabled is deprecated in moby and always false now
+	// Figure out what we want to do with this
+	info.BridgeNfIP6tables = true // !mobySysInfo.BridgeNFCallIP6TablesDisabled
 	if !info.BridgeNfIP6tables {
 		info.Warnings = append(info.Warnings, "WARNING: bridge-nf-call-ip6tables is disabled")
 	}
-	info.NCPU = sysinfo.NumCPU()
-	memLimit, err := system.ReadMemInfo()
+	info.NCPU = runtime.NumCPU()
+	memLimit, err := meminfo.Read()
 	if err != nil {
 		info.Warnings = append(info.Warnings, fmt.Sprintf("failed to read mem info: %v", err))
 	} else {

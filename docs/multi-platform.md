@@ -11,11 +11,12 @@ e.g., ARM on Intel, and vice versa.
 ```console
 $ sudo systemctl start containerd
 
-$ sudo nerdctl run --privileged --rm tonistiigi/binfmt --install all
+$ sudo nerdctl run --privileged --rm tonistiigi/binfmt:master --install all
 
 $ ls -1 /proc/sys/fs/binfmt_misc/qemu*
 /proc/sys/fs/binfmt_misc/qemu-aarch64
 /proc/sys/fs/binfmt_misc/qemu-arm
+/proc/sys/fs/binfmt_misc/qemu-loongarch64
 /proc/sys/fs/binfmt_misc/qemu-mips64
 /proc/sys/fs/binfmt_misc/qemu-mips64el
 /proc/sys/fs/binfmt_misc/qemu-ppc64le
@@ -57,3 +58,16 @@ $ nerdctl push --all-platforms example.com/foo:latest
 
 ### Compose
 See [`../examples/compose-multi-platform`](../examples/compose-multi-platform)
+
+## macOS + Lima
+
+As of 2025-03-01, qemu seems to be broken in most Apple-silicon setups.
+This might be due to qemu handling of host vs. guest page sizes
+(unconfirmed, see https://github.com/containerd/nerdctl/issues/3948 for more information).
+
+It should also be noted that Linux 6.11 introduced a change to the VDSO (on ARM)
+that does break Rosetta.
+
+The take-away here is that presumably your only shot at running non-native binaries
+on Apple-silicon is to use an older kernel for your guest (<6.11), typically as shipped by Debian stable,
+and also to use VZ+Rosetta and not qemu (eg: `limactl create --vm-type=vz --rosetta`).

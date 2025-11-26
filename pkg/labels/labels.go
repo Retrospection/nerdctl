@@ -15,7 +15,7 @@
 */
 
 // Package labels defines labels that are set to containerd containers as labels.
-// The labels are also passed to OCI containers as annotations.
+// The labels defined in this package are also passed to OCI containers as annotations.
 package labels
 
 const (
@@ -41,8 +41,14 @@ const (
 	//Compose Volume Name
 	ComposeVolume = "com.docker.compose.volume"
 
+	// ComposeConfigHash stores the service configuration hash used for convergence decisions
+	ComposeConfigHash = "com.docker.compose.config-hash"
+
 	// Hostname
 	Hostname = Prefix + "hostname"
+
+	// Domainname
+	Domainname = Prefix + "domainname"
 
 	// ExtraHosts are HostIPs to appended to /etc/hosts
 	ExtraHosts = Prefix + "extraHosts"
@@ -54,12 +60,15 @@ const (
 	// Currently, the length of the slice must be 1.
 	Networks = Prefix + "networks"
 
-	// Ports is a JSON-marshalled string of []gocni.PortMapping .
+	// DEPRECATED : https://github.com/containerd/nerdctl/pull/4290
+	// Ports is a JSON-marshalled string of []cni.PortMapping .
 	Ports = Prefix + "ports"
 
 	// IPAddress is the static IP address of the container assigned by the user
-
 	IPAddress = Prefix + "ip"
+
+	// IP6Address is the static IP6 address of the container assigned by the user
+	IP6Address = Prefix + "ip6"
 
 	// LogURI is the log URI
 	LogURI = Prefix + "log-uri"
@@ -77,28 +86,46 @@ const (
 	// Mounts is the mount points for the container.
 	Mounts = Prefix + "mounts"
 
-	// Bypass4netns is the flag for acceleration with bypass4netns
-	// Boolean value which can be parsed with strconv.ParseBool() is required.
-	// (like "nerdctl/bypass4netns=true" or "nerdctl/bypass4netns=false")
-	Bypass4netns = Prefix + "bypass4netns"
-
 	// StopTimeout is seconds to wait for stop a container.
-	StopTimout = Prefix + "stop-timeout"
+	StopTimeout = Prefix + "stop-timeout"
 
 	MACAddress = Prefix + "mac-address"
 
 	// PIDContainer is the `nerdctl run --pid` for restarting
 	PIDContainer = Prefix + "pid-container"
 
+	// IPC is the `nerectl run --ipc` for restrating
+	// IPC indicates ipc victim container.
+	IPC = Prefix + "ipc"
+
+	// Error encapsulates a container human-readable string
+	// that describes container error.
+	Error = Prefix + "error"
+
 	// NerdctlDefaultNetwork indicates whether a network is the default network
 	// created and owned by Nerdctl.
 	// Boolean value which can be parsed with strconv.ParseBool() is required.
 	// (like "nerdctl/default-network=true" or "nerdctl/default-network=false")
 	NerdctlDefaultNetwork = Prefix + "default-network"
-)
 
-var ShellCompletions = []string{
-	Bypass4netns + "=true",
-	Bypass4netns + "=false",
-	// Other labels should not be set via CLI
-}
+	// ContainerAutoRemove is to check whether the --rm option is specified.
+	ContainerAutoRemove = Prefix + "auto-remove"
+
+	// LogConfig defines the logging configuration passed to the container
+	LogConfig = Prefix + "log-config"
+
+	// HostConfigLabel sets the dockercompat host config values
+	HostConfigLabel = Prefix + "host-config"
+
+	// DNSSettings sets the dockercompat DNS config values
+	DNSSetting = Prefix + "dns"
+
+	// User is the username of the container
+	User = Prefix + "user"
+
+	// HealthCheck stores the health check configuration used to run health checks on the container
+	HealthCheck = Prefix + "healthcheck"
+
+	// HealthState stores the current health state (status and failing streak).
+	HealthState = Prefix + "healthstate"
+)

@@ -22,14 +22,17 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/containerd/containerd/plugin"
-	gocni "github.com/containerd/go-cni"
-	"github.com/containerd/nerdctl/pkg/rootlessutil"
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/containerd/v2/plugins"
+	"github.com/containerd/go-cni"
+
+	"github.com/containerd/nerdctl/v2/pkg/rootlessutil"
 )
 
-const AppArmorProfileName = "nerdctl-default"
-const Runtime = plugin.RuntimeRuncV2
+const (
+	AppArmorProfileName = "nerdctl-default"
+	SeccompProfileName  = "builtin"
+	Runtime             = plugins.RuntimeRuncV2
+)
 
 func DataRoot() string {
 	if !rootlessutil.IsRootless() {
@@ -44,6 +47,7 @@ func DataRoot() string {
 
 func CNIPath() string {
 	candidates := []string{
+		cni.DefaultCNIDir, // /opt/cni/bin
 		"/usr/local/libexec/cni",
 		"/usr/local/lib/cni",
 		"/usr/libexec/cni", // Fedora
@@ -56,9 +60,9 @@ func CNIPath() string {
 		}
 		candidates = append([]string{
 			// NOTE: These user paths are not defined in XDG
+			filepath.Join(home, "opt/cni/bin"),
 			filepath.Join(home, ".local/libexec/cni"),
 			filepath.Join(home, ".local/lib/cni"),
-			filepath.Join(home, "opt/cni/bin"),
 		}, candidates...)
 	}
 
@@ -69,12 +73,12 @@ func CNIPath() string {
 	}
 
 	// default: /opt/cni/bin
-	return gocni.DefaultCNIDir
+	return cni.DefaultCNIDir
 }
 
 func CNINetConfPath() string {
 	if !rootlessutil.IsRootless() {
-		return gocni.DefaultNetDir
+		return cni.DefaultNetDir
 	}
 	xch, err := rootlessutil.XDGConfigHome()
 	if err != nil {
@@ -83,28 +87,18 @@ func CNINetConfPath() string {
 	return filepath.Join(xch, "cni/net.d")
 }
 
-func CNIRuntimeDir() string {
+func CNIRuntimeDir() (string, error) {
 	if !rootlessutil.IsRootless() {
-		return "/run/cni"
+		return "/run/cni", nil
 	}
 	xdr, err := rootlessutil.XDGRuntimeDir()
 	if err != nil {
-		logrus.Warn(err)
-		xdr = fmt.Sprintf("/run/user/%d", rootlessutil.ParentEUID())
+		if rootlessutil.IsRootlessChild() {
+			return "", err
+		}
+		xdr = fmt.Sprintf("/run/user/%d", os.Geteuid())
 	}
-	return fmt.Sprintf("%s/cni", xdr)
-}
-
-func BuildKitHost() string {
-	if !rootlessutil.IsRootless() {
-		return "unix:///run/buildkit/buildkitd.sock"
-	}
-	xdr, err := rootlessutil.XDGRuntimeDir()
-	if err != nil {
-		logrus.Warn(err)
-		xdr = fmt.Sprintf("/run/user/%d", rootlessutil.ParentEUID())
-	}
-	return fmt.Sprintf("unix://%s/buildkit/buildkitd.sock", xdr)
+	return filepath.Join(xdr, "cni"), nil
 }
 
 func NerdctlTOML() string {
@@ -134,6 +128,7 @@ func HostsDirs() []string {
 
 // HostGatewayIP returns the non-loop-back host ip if available and returns empty string if running into error.
 func HostGatewayIP() string {
+	// no need to use [rootlessutil.WithDetachedNetNSIfAny] here
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
 		return ""
@@ -146,4 +141,25 @@ func HostGatewayIP() string {
 		}
 	}
 	return ""
+}
+
+func CDISpecDirs() []string {
+	if !rootlessutil.IsRootless() {
+		return []string{"/etc/cdi", "/var/run/cdi"}
+	}
+	xch, err := rootlessutil.XDGConfigHome()
+	if err != nil {
+		panic(err)
+	}
+	xdr, err := rootlessutil.XDGRuntimeDir()
+	if err != nil {
+		if rootlessutil.IsRootlessChild() {
+			panic(err)
+		}
+		xdr = fmt.Sprintf("/run/user/%d", os.Geteuid())
+	}
+	return []string{
+		filepath.Join(xch, "cdi"),
+		filepath.Join(xdr, "cdi"),
+	}
 }

@@ -23,11 +23,14 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/compose-spec/compose-go/types"
-	"github.com/containerd/nerdctl/pkg/composer/serviceparser"
-	"github.com/containerd/nerdctl/pkg/labels"
-	"github.com/sirupsen/logrus"
+	"github.com/compose-spec/compose-go/v2/types"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/composer/serviceparser"
+	"github.com/containerd/nerdctl/v2/pkg/internal/filesystem"
+	"github.com/containerd/nerdctl/v2/pkg/labels"
 )
 
 // FYI: https://github.com/docker/compose/blob/v2.14.1/pkg/api/api.go#L423
@@ -117,7 +120,7 @@ func (c *Composer) Create(ctx context.Context, opt CreateOptions, services []str
 		return err
 	}
 	for _, ps := range parsedServices {
-		if err := c.ensureServiceImage(ctx, ps, !opt.NoBuild, opt.Build, BuildOptions{}, false); err != nil {
+		if err := c.ensureServiceImage(ctx, ps, !opt.NoBuild, opt.Build, BuildOptions{}, false, ""); err != nil {
 			return err
 		}
 	}
@@ -144,10 +147,7 @@ func (c *Composer) createService(ctx context.Context, ps *serviceparser.Service,
 			return nil
 		})
 	}
-	if err := runEG.Wait(); err != nil {
-		return err
-	}
-	return nil
+	return runEG.Wait()
 }
 
 // createServiceContainer must be called after ensureServiceImage
@@ -160,24 +160,24 @@ func (c *Composer) createServiceContainer(ctx context.Context, service *servicep
 	// check if container already exists
 	exists, err := c.containerExists(ctx, container.Name, service.Unparsed.Name)
 	if err != nil {
-		return "", fmt.Errorf("error while checking for containers with name %q: %s", container.Name, err)
+		return "", fmt.Errorf("error while checking for containers with name %q: %w", container.Name, err)
 	}
 
 	// delete container if it already exists and force-recreate is enabled
 	if exists {
 		if recreate != RecreateForce {
-			logrus.Infof("Container %s exists, skipping", container.Name)
+			log.G(ctx).Infof("Container %s exists, skipping", container.Name)
 			return "", nil
 		}
 
-		logrus.Debugf("Container %q already exists and force-created is enabled, deleting", container.Name)
+		log.G(ctx).Debugf("Container %q already exists and force-created is enabled, deleting", container.Name)
 		delCmd := c.createNerdctlCmd(ctx, "rm", "-f", container.Name)
 		if err = delCmd.Run(); err != nil {
-			return "", fmt.Errorf("could not delete container %q: %s", container.Name, err)
+			return "", fmt.Errorf("could not delete container %q: %w", container.Name, err)
 		}
-		logrus.Infof("Re-creating container %s", container.Name)
+		log.G(ctx).Infof("Re-creating container %s", container.Name)
 	} else {
-		logrus.Infof("Creating container %s", container.Name)
+		log.G(ctx).Infof("Creating container %s", container.Name)
 	}
 
 	tempDir, err := os.MkdirTemp(os.TempDir(), "compose-")
@@ -188,15 +188,20 @@ func (c *Composer) createServiceContainer(ctx context.Context, service *servicep
 	cidFilename := filepath.Join(tempDir, "cid")
 
 	//add metadata labels to container https://github.com/compose-spec/compose-spec/blob/master/spec.md#labels
+	currentHash, err := ServiceHash(*service.Unparsed)
+	if err != nil {
+		return "", fmt.Errorf("failed computing service hash for %s: %w", container.Name, err)
+	}
 	container.RunArgs = append([]string{
 		"--cidfile=" + cidFilename,
 		fmt.Sprintf("-l=%s=%s", labels.ComposeProject, c.project.Name),
 		fmt.Sprintf("-l=%s=%s", labels.ComposeService, service.Unparsed.Name),
+		fmt.Sprintf("-l=%s=%s", labels.ComposeConfigHash, currentHash),
 	}, container.RunArgs...)
 
 	cmd := c.createNerdctlCmd(ctx, append([]string{"create"}, container.RunArgs...)...)
 	if c.DebugPrintFull {
-		logrus.Debugf("Running %v", cmd.Args)
+		log.G(ctx).Debugf("Running %v", cmd.Args)
 	}
 
 	// FIXME
@@ -209,7 +214,7 @@ func (c *Composer) createServiceContainer(ctx context.Context, service *servicep
 		return "", fmt.Errorf("error while creating container %s: %w", container.Name, err)
 	}
 
-	cid, err := os.ReadFile(cidFilename)
+	cid, err := filesystem.ReadFile(cidFilename)
 	if err != nil {
 		return "", fmt.Errorf("error while creating container %s: %w", container.Name, err)
 	}

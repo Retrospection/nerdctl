@@ -17,8 +17,9 @@
 package native
 
 import (
-	"github.com/containerd/containerd/images"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+
+	"github.com/containerd/containerd/v2/core/images"
 )
 
 // Image corresponds to a containerd-native image object.
@@ -32,4 +33,5 @@ type Image struct {
 	// e.g., "application/vnd.docker.container.image.v1+json"
 	ImageConfigDesc ocispec.Descriptor `json:"ImageConfigDesc"`
 	ImageConfig     ocispec.Image      `json:"ImageConfig"`
+	Size            int64              `json:"size"`
 }

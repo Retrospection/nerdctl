@@ -27,24 +27,33 @@ import (
 	"strings"
 	"time"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/cio"
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/diff"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/leases"
-	"github.com/containerd/containerd/platforms"
-	"github.com/containerd/containerd/rootfs"
-	"github.com/containerd/containerd/snapshots"
-	imgutil "github.com/containerd/nerdctl/pkg/imgutil"
-	"github.com/containerd/nerdctl/pkg/labels"
+	"github.com/klauspost/compress/zstd"
 	"github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/identity"
 	"github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
-	"github.com/sirupsen/logrus"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/diff"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/leases"
+	"github.com/containerd/containerd/v2/core/snapshots"
+	"github.com/containerd/containerd/v2/pkg/cio"
+	"github.com/containerd/containerd/v2/pkg/rootfs"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/log"
+	"github.com/containerd/platforms"
+	"github.com/containerd/stargz-snapshotter/estargz"
+	estargzconvert "github.com/containerd/stargz-snapshotter/nativeconverter/estargz"
+	zstdchunkedconvert "github.com/containerd/stargz-snapshotter/nativeconverter/zstdchunked"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
+	"github.com/containerd/nerdctl/v2/pkg/clientutil"
+	"github.com/containerd/nerdctl/v2/pkg/cmd/image"
+	"github.com/containerd/nerdctl/v2/pkg/containerutil"
+	"github.com/containerd/nerdctl/v2/pkg/imgutil"
+	"github.com/containerd/nerdctl/v2/pkg/labels"
 )
 
 type Changes struct {
@@ -52,11 +61,15 @@ type Changes struct {
 }
 
 type Opts struct {
-	Author  string
-	Message string
-	Ref     string
-	Pause   bool
-	Changes Changes
+	Author      string
+	Message     string
+	Ref         string
+	Pause       bool
+	Changes     Changes
+	Compression types.CompressionType
+	Format      types.ImageFormat
+	types.EstargzOptions
+	types.ZstdChunkedOptions
 }
 
 var (
@@ -64,7 +77,34 @@ var (
 	emptyDigest  = digest.Digest("")
 )
 
-func Commit(ctx context.Context, client *containerd.Client, container containerd.Container, opts *Opts) (digest.Digest, error) {
+func Commit(ctx context.Context, client *containerd.Client, container containerd.Container, opts *Opts, globalOptions types.GlobalCommandOptions) (digest.Digest, error) {
+	// Get labels
+	containerLabels, err := container.Labels(ctx)
+	if err != nil {
+		return emptyDigest, err
+	}
+
+	// Get datastore
+	dataStore, err := clientutil.DataStore(globalOptions.DataRoot, globalOptions.Address)
+	if err != nil {
+		return emptyDigest, err
+	}
+
+	// Ensure we do have a stateDir label
+	stateDir := containerLabels[labels.StateDir]
+	if stateDir == "" {
+		stateDir, err = containerutil.ContainerStateDirPath(globalOptions.Namespace, dataStore, container.ID())
+		if err != nil {
+			return emptyDigest, err
+		}
+	}
+
+	lf, err := containerutil.Lock(stateDir)
+	if err != nil {
+		return emptyDigest, err
+	}
+	defer lf.Release()
+
 	id := container.ID()
 	info, err := container.Info(ctx)
 	if err != nil {
@@ -80,13 +120,13 @@ func Commit(ctx context.Context, client *containerd.Client, container containerd
 	platformLabel := info.Labels[labels.Platform]
 	if platformLabel == "" {
 		platformLabel = platforms.DefaultString()
-		logrus.Warnf("Image lacks label %q, assuming the platform to be %q", labels.Platform, platformLabel)
+		log.G(ctx).Warnf("Image lacks label %q, assuming the platform to be %q", labels.Platform, platformLabel)
 	}
 	ocispecPlatform, err := platforms.Parse(platformLabel)
 	if err != nil {
 		return emptyDigest, err
 	}
-	logrus.Debugf("ocispecPlatform=%q", platforms.Format(ocispecPlatform))
+	log.G(ctx).Debugf("ocispecPlatform=%q", platforms.Format(ocispecPlatform))
 	platformMC := platforms.Only(ocispecPlatform)
 	baseImg := containerd.NewImageWithPlatform(client, baseImgWithoutPlatform, platformMC)
 
@@ -95,12 +135,19 @@ func Commit(ctx context.Context, client *containerd.Client, container containerd
 		return emptyDigest, err
 	}
 
-	task, err := container.Task(ctx, cio.Load)
+	// Ensure all the layers are here: https://github.com/containerd/nerdctl/issues/3425
+	err = image.EnsureAllContent(ctx, client, baseImg.Name(), platformMC, globalOptions)
 	if err != nil {
-		return emptyDigest, err
+		log.G(ctx).Warn("Unable to fetch missing layers before committing. " +
+			"If you try to save or push this image, it might fail. See https://github.com/containerd/nerdctl/issues/3439.")
 	}
 
 	if opts.Pause {
+		task, err := container.Task(ctx, cio.Load)
+		if err != nil {
+			return emptyDigest, err
+		}
+
 		status, err := task.Status(ctx)
 		if err != nil {
 			return emptyDigest, err
@@ -115,7 +162,7 @@ func Commit(ctx context.Context, client *containerd.Client, container containerd
 
 			defer func() {
 				if err := task.Resume(ctx); err != nil {
-					logrus.Warnf("failed to unpause container %v: %v", id, err)
+					log.G(ctx).Warnf("failed to unpause container %v: %v", id, err)
 				}
 			}()
 		}
@@ -134,7 +181,13 @@ func Commit(ctx context.Context, client *containerd.Client, container containerd
 	}
 	defer done(ctx)
 
-	diffLayerDesc, diffID, err := createDiff(ctx, id, sn, client.ContentStore(), differ)
+	// Sync filesystem to make sure that all the data writes in container could be persisted to disk.
+	Sync()
+
+	if opts.ZstdChunked {
+		opts.Compression = types.Zstd
+	}
+	diffLayerDesc, diffID, err := createDiff(ctx, id, sn, client.ContentStore(), differ, opts.Compression, opts)
 	if err != nil {
 		return emptyDigest, fmt.Errorf("failed to export layer: %w", err)
 	}
@@ -149,7 +202,7 @@ func Commit(ctx context.Context, client *containerd.Client, container containerd
 		return emptyDigest, fmt.Errorf("failed to apply diff: %w", err)
 	}
 
-	commitManifestDesc, configDigest, err := writeContentsForImage(ctx, snName, baseImg, imageConfig, diffLayerDesc)
+	commitManifestDesc, configDigest, err := writeContentsForImage(ctx, snName, baseImg, imageConfig, diffLayerDesc, opts)
 	if err != nil {
 		return emptyDigest, err
 	}
@@ -170,6 +223,13 @@ func Commit(ctx context.Context, client *containerd.Client, container containerd
 			return emptyDigest, fmt.Errorf("failed to create new image %s: %w", opts.Ref, err)
 		}
 	}
+
+	// unpack the image to snapshotter
+	cimg := containerd.NewImage(client, img)
+	if err := cimg.Unpack(ctx, snName); err != nil {
+		return emptyDigest, err
+	}
+
 	return configDigest, nil
 }
 
@@ -205,17 +265,19 @@ func generateCommitImageConfig(ctx context.Context, container containerd.Contain
 	arch := baseConfig.Architecture
 	if arch == "" {
 		arch = runtime.GOARCH
-		logrus.Warnf("assuming arch=%q", arch)
+		log.G(ctx).Warnf("assuming arch=%q", arch)
 	}
 	os := baseConfig.OS
 	if os == "" {
 		os = runtime.GOOS
-		logrus.Warnf("assuming os=%q", os)
+		log.G(ctx).Warnf("assuming os=%q", os)
 	}
-	logrus.Debugf("generateCommitImageConfig(): arch=%q, os=%q", arch, os)
+	log.G(ctx).Debugf("generateCommitImageConfig(): arch=%q, os=%q", arch, os)
 	return ocispec.Image{
-		Architecture: arch,
-		OS:           os,
+		Platform: ocispec.Platform{
+			Architecture: arch,
+			OS:           os,
+		},
 
 		Created: &createdTime,
 		Author:  opts.Author,
@@ -235,14 +297,29 @@ func generateCommitImageConfig(ctx context.Context, container containerd.Contain
 }
 
 // writeContentsForImage will commit oci image config and manifest into containerd's content store.
-func writeContentsForImage(ctx context.Context, snName string, baseImg containerd.Image, newConfig ocispec.Image, diffLayerDesc ocispec.Descriptor) (ocispec.Descriptor, digest.Digest, error) {
+func writeContentsForImage(ctx context.Context, snName string, baseImg containerd.Image, newConfig ocispec.Image, diffLayerDesc ocispec.Descriptor, opts *Opts) (ocispec.Descriptor, digest.Digest, error) {
 	newConfigJSON, err := json.Marshal(newConfig)
 	if err != nil {
 		return ocispec.Descriptor{}, emptyDigest, err
 	}
 
+	// Select media types based on format choice
+	var configMediaType, manifestMediaType string
+	switch opts.Format {
+	case types.ImageFormatOCI:
+		configMediaType = ocispec.MediaTypeImageConfig
+		manifestMediaType = ocispec.MediaTypeImageManifest
+	case types.ImageFormatDocker:
+		configMediaType = images.MediaTypeDockerSchema2Config
+		manifestMediaType = images.MediaTypeDockerSchema2Manifest
+	default:
+		// Default to Docker Schema2 for compatibility
+		configMediaType = images.MediaTypeDockerSchema2Config
+		manifestMediaType = images.MediaTypeDockerSchema2Manifest
+	}
+
 	configDesc := ocispec.Descriptor{
-		MediaType: images.MediaTypeDockerSchema2Config,
+		MediaType: configMediaType,
 		Digest:    digest.FromBytes(newConfigJSON),
 		Size:      int64(len(newConfigJSON)),
 	}
@@ -258,7 +335,7 @@ func writeContentsForImage(ctx context.Context, snName string, baseImg container
 		MediaType string `json:"mediaType,omitempty"`
 		ocispec.Manifest
 	}{
-		MediaType: images.MediaTypeDockerSchema2Manifest,
+		MediaType: manifestMediaType,
 		Manifest: ocispec.Manifest{
 			Versioned: specs.Versioned{
 				SchemaVersion: 2,
@@ -274,7 +351,7 @@ func writeContentsForImage(ctx context.Context, snName string, baseImg container
 	}
 
 	newMfstDesc := ocispec.Descriptor{
-		MediaType: images.MediaTypeDockerSchema2Manifest,
+		MediaType: manifestMediaType,
 		Digest:    digest.FromBytes(newMfstJSON),
 		Size:      int64(len(newMfstJSON)),
 	}
@@ -305,8 +382,45 @@ func writeContentsForImage(ctx context.Context, snName string, baseImg container
 }
 
 // createDiff creates a layer diff into containerd's content store.
-func createDiff(ctx context.Context, name string, sn snapshots.Snapshotter, cs content.Store, comparer diff.Comparer) (ocispec.Descriptor, digest.Digest, error) {
-	newDesc, err := rootfs.CreateDiff(ctx, name, sn, comparer)
+func createDiff(ctx context.Context, name string, sn snapshots.Snapshotter, cs content.Store, comparer diff.Comparer, compression types.CompressionType, opts *Opts) (ocispec.Descriptor, digest.Digest, error) {
+	diffOpts := make([]diff.Opt, 0)
+	var mediaType string
+
+	// Select media type based on format and compression
+	switch opts.Format {
+	case types.ImageFormatOCI:
+		// Use OCI media types
+		switch compression {
+		case types.Zstd:
+			diffOpts = append(diffOpts, diff.WithMediaType(ocispec.MediaTypeImageLayerZstd))
+			mediaType = ocispec.MediaTypeImageLayerZstd
+		default:
+			diffOpts = append(diffOpts, diff.WithMediaType(ocispec.MediaTypeImageLayerGzip))
+			mediaType = ocispec.MediaTypeImageLayerGzip
+		}
+	case types.ImageFormatDocker:
+		// Use Docker Schema2 media types for compatibility
+		switch compression {
+		case types.Zstd:
+			diffOpts = append(diffOpts, diff.WithMediaType(ocispec.MediaTypeImageLayerZstd))
+			mediaType = images.MediaTypeDockerSchema2LayerZstd
+		default:
+			diffOpts = append(diffOpts, diff.WithMediaType(ocispec.MediaTypeImageLayerGzip))
+			mediaType = images.MediaTypeDockerSchema2LayerGzip
+		}
+	default:
+		// Default to Docker Schema2 media types for compatibility
+		switch compression {
+		case types.Zstd:
+			diffOpts = append(diffOpts, diff.WithMediaType(ocispec.MediaTypeImageLayerZstd))
+			mediaType = images.MediaTypeDockerSchema2LayerZstd
+		default:
+			diffOpts = append(diffOpts, diff.WithMediaType(ocispec.MediaTypeImageLayerGzip))
+			mediaType = images.MediaTypeDockerSchema2LayerGzip
+		}
+	}
+
+	newDesc, err := rootfs.CreateDiff(ctx, name, sn, comparer, diffOpts...)
 	if err != nil {
 		return ocispec.Descriptor{}, digest.Digest(""), err
 	}
@@ -326,8 +440,90 @@ func createDiff(ctx context.Context, name string, sn snapshots.Snapshotter, cs c
 		return ocispec.Descriptor{}, digest.Digest(""), err
 	}
 
+	// Convert to eStargz if requested
+	if opts.Estargz {
+		log.G(ctx).Infof("Converting diff layer to eStargz format")
+
+		esgzOpts := []estargz.Option{
+			estargz.WithCompressionLevel(opts.EstargzCompressionLevel),
+		}
+		if opts.EstargzChunkSize > 0 {
+			esgzOpts = append(esgzOpts, estargz.WithChunkSize(opts.EstargzChunkSize))
+		}
+		if opts.EstargzMinChunkSize > 0 {
+			esgzOpts = append(esgzOpts, estargz.WithMinChunkSize(opts.EstargzMinChunkSize))
+		}
+
+		convertFunc := estargzconvert.LayerConvertFunc(esgzOpts...)
+
+		esgzDesc, err := convertFunc(ctx, cs, newDesc)
+		if err != nil {
+			return ocispec.Descriptor{}, digest.Digest(""), fmt.Errorf("failed to convert diff layer to eStargz: %w", err)
+		} else if esgzDesc != nil {
+			esgzDesc.MediaType = mediaType
+			esgzInfo, err := cs.Info(ctx, esgzDesc.Digest)
+			if err != nil {
+				return ocispec.Descriptor{}, digest.Digest(""), err
+			}
+
+			esgzDiffIDStr, ok := esgzInfo.Labels["containerd.io/uncompressed"]
+			if !ok {
+				return ocispec.Descriptor{}, digest.Digest(""), fmt.Errorf("invalid differ response with no diffID")
+			}
+
+			esgzDiffID, err := digest.Parse(esgzDiffIDStr)
+			if err != nil {
+				return ocispec.Descriptor{}, digest.Digest(""), err
+			}
+			return ocispec.Descriptor{
+				MediaType:   esgzDesc.MediaType,
+				Digest:      esgzDesc.Digest,
+				Size:        esgzDesc.Size,
+				Annotations: esgzDesc.Annotations,
+			}, esgzDiffID, nil
+		}
+	}
+
+	// Convert to zstd:chunked if requested
+	if opts.ZstdChunked {
+		log.G(ctx).Infof("Converting diff layer to zstd:chunked format")
+
+		esgzOpts := []estargz.Option{
+			estargz.WithChunkSize(opts.ZstdChunkedChunkSize),
+		}
+
+		convertFunc := zstdchunkedconvert.LayerConvertFuncWithCompressionLevel(zstd.EncoderLevelFromZstd(opts.ZstdChunkedCompressionLevel), esgzOpts...)
+
+		zstdchunkedDesc, err := convertFunc(ctx, cs, newDesc)
+		if err != nil {
+			return ocispec.Descriptor{}, digest.Digest(""), fmt.Errorf("failed to convert diff layer to zstd:chunked: %w", err)
+		} else if zstdchunkedDesc != nil {
+			zstdchunkedDesc.MediaType = mediaType
+			zstdchunkedInfo, err := cs.Info(ctx, zstdchunkedDesc.Digest)
+			if err != nil {
+				return ocispec.Descriptor{}, digest.Digest(""), err
+			}
+
+			zstdchunkedDiffIDStr, ok := zstdchunkedInfo.Labels["containerd.io/uncompressed"]
+			if !ok {
+				return ocispec.Descriptor{}, digest.Digest(""), fmt.Errorf("invalid differ response with no diffID")
+			}
+
+			zstdchunkedDiffID, err := digest.Parse(zstdchunkedDiffIDStr)
+			if err != nil {
+				return ocispec.Descriptor{}, digest.Digest(""), err
+			}
+			return ocispec.Descriptor{
+				MediaType:   zstdchunkedDesc.MediaType,
+				Digest:      zstdchunkedDesc.Digest,
+				Size:        zstdchunkedDesc.Size,
+				Annotations: zstdchunkedDesc.Annotations,
+			}, zstdchunkedDiffID, nil
+		}
+	}
+
 	return ocispec.Descriptor{
-		MediaType: images.MediaTypeDockerSchema2LayerGzip,
+		MediaType: mediaType,
 		Digest:    newDesc.Digest,
 		Size:      info.Size,
 	}, diffID, nil
@@ -350,7 +546,7 @@ func applyDiffLayer(ctx context.Context, name string, baseImg ocispec.Image, sn 
 			// NOTE: the snapshotter should be hold by lease. Even
 			// if the cleanup fails, the containerd gc can delete it.
 			if err := sn.Remove(ctx, key); err != nil {
-				logrus.Warnf("failed to cleanup aborted apply %s: %s", key, err)
+				log.G(ctx).Warnf("failed to cleanup aborted apply %s: %s", key, err)
 			}
 		}
 	}()

@@ -25,29 +25,30 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/cmd/ctr/commands/content"
-	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/log"
-	"github.com/containerd/containerd/pkg/progress"
-	"github.com/containerd/containerd/platforms"
-	"github.com/containerd/containerd/remotes"
-	"github.com/containerd/containerd/remotes/docker"
-	"github.com/containerd/nerdctl/pkg/imgutil/dockerconfigresolver"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-
 	"golang.org/x/sync/errgroup"
+
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/remotes"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/containerd/v2/pkg/progress"
+	"github.com/containerd/log"
+	"github.com/containerd/platforms"
+
+	"github.com/containerd/nerdctl/v2/pkg/imgutil/jobs"
 )
 
-func Push(ctx context.Context, client *containerd.Client, resolver remotes.Resolver, stdout io.Writer,
-	localRef, remoteRef string, platform platforms.MatchComparer, allowNonDist bool) error {
+// Push pushes an image to a remote registry.
+func Push(ctx context.Context, client *containerd.Client, resolver remotes.Resolver, pushTracker docker.StatusTracker, stdout io.Writer,
+	localRef, remoteRef string, platform platforms.MatchComparer, allowNonDist, quiet bool) error {
 	img, err := client.ImageService().Get(ctx, localRef)
 	if err != nil {
 		return fmt.Errorf("unable to resolve image to manifest: %w", err)
 	}
 	desc := img.Target
 
-	ongoing := newPushJobs(dockerconfigresolver.PushTracker)
+	ongoing := newPushJobs(pushTracker)
 
 	eg, ctx := errgroup.WithContext(ctx)
 
@@ -77,37 +78,39 @@ func Push(ctx context.Context, client *containerd.Client, resolver remotes.Resol
 		)
 	})
 
-	eg.Go(func() error {
-		var (
-			ticker = time.NewTicker(100 * time.Millisecond)
-			fw     = progress.NewWriter(stdout)
-			start  = time.Now()
-			done   bool
-		)
+	if !quiet {
+		eg.Go(func() error {
+			var (
+				ticker = time.NewTicker(100 * time.Millisecond)
+				fw     = progress.NewWriter(stdout)
+				start  = time.Now()
+				done   bool
+			)
 
-		defer ticker.Stop()
+			defer ticker.Stop()
 
-		for {
-			select {
-			case <-ticker.C:
-				fw.Flush()
-
-				tw := tabwriter.NewWriter(fw, 1, 8, 1, ' ', 0)
-
-				content.Display(tw, ongoing.status(), start)
-				tw.Flush()
-
-				if done {
+			for {
+				select {
+				case <-ticker.C:
 					fw.Flush()
-					return nil
+
+					tw := tabwriter.NewWriter(fw, 1, 8, 1, ' ', 0)
+
+					jobs.Display(tw, ongoing.status(), start)
+					tw.Flush()
+
+					if done {
+						fw.Flush()
+						return nil
+					}
+				case <-doneCh:
+					done = true
+				case <-ctx.Done():
+					done = true // allow ui to update once more
 				}
-			case <-doneCh:
-				done = true
-			case <-ctx.Done():
-				done = true // allow ui to update once more
 			}
-		}
-	})
+		})
+	}
 	return eg.Wait()
 }
 
@@ -136,13 +139,13 @@ func (j *pushjobs) add(ref string) {
 	j.jobs[ref] = struct{}{}
 }
 
-func (j *pushjobs) status() []content.StatusInfo {
+func (j *pushjobs) status() []jobs.StatusInfo {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
-	statuses := make([]content.StatusInfo, 0, len(j.jobs))
+	statuses := make([]jobs.StatusInfo, 0, len(j.jobs))
 	for _, name := range j.ordered {
-		si := content.StatusInfo{
+		si := jobs.StatusInfo{
 			Ref: name,
 		}
 

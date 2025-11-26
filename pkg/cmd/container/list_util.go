@@ -19,13 +19,17 @@ package container
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/containers"
-	"github.com/sirupsen/logrus"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/containerutil"
 )
 
 func foldContainerFilters(ctx context.Context, containers []containerd.Container, filters []string) (*containerFilterContext, error) {
@@ -44,8 +48,10 @@ type containerFilterContext struct {
 	sinceFilterFuncs   []func(t time.Time) bool
 	statusFilterFuncs  []func(containerd.ProcessStatus) bool
 	labelFilterFuncs   []func(map[string]string) bool
-	volumeFilterFuncs  []func([]*containerVolume) bool
+	volumeFilterFuncs  []func([]*containerutil.ContainerVolume) bool
 	networkFilterFuncs []func([]string) bool
+
+	all bool
 }
 
 func (cl *containerFilterContext) MatchesFilters(ctx context.Context) []containerd.Container {
@@ -102,6 +108,7 @@ func (cl *containerFilterContext) foldExitedFilter(_ context.Context, filter, va
 	if err != nil {
 		return err
 	}
+	log.L.Infof("checking exit status %v %v", filter, value)
 	cl.exitedFilterFuncs = append(cl.exitedFilterFuncs, func(exitStatus int) bool {
 		return exited == exitStatus
 	})
@@ -120,7 +127,7 @@ func (cl *containerFilterContext) foldStatusFilter(_ context.Context, filter, va
 			return containerd.Stopped == stats
 		})
 	case containerd.ProcessStatus("restarting"), containerd.ProcessStatus("removing"), containerd.ProcessStatus("dead"):
-		logrus.Warnf("%s is not supported and is ignored", filter)
+		log.L.Warnf("%s is not supported and is ignored", filter)
 	default:
 		return fmt.Errorf("invalid filter '%s'", filter)
 	}
@@ -158,11 +165,15 @@ func (cl *containerFilterContext) foldIDFilter(_ context.Context, filter, value 
 }
 
 func (cl *containerFilterContext) foldNameFilter(_ context.Context, filter, value string) error {
+	re, err := regexp.Compile(value)
+	if err != nil {
+		return err
+	}
 	cl.nameFilterFuncs = append(cl.nameFilterFuncs, func(name string) bool {
 		if value == "" {
 			return true
 		}
-		return strings.Contains(name, value)
+		return re.MatchString(name)
 	})
 	return nil
 }
@@ -187,7 +198,7 @@ func (cl *containerFilterContext) foldLabelFilter(_ context.Context, filter, val
 }
 
 func (cl *containerFilterContext) foldVolumeFilter(_ context.Context, filter, value string) error {
-	cl.volumeFilterFuncs = append(cl.volumeFilterFuncs, func(vols []*containerVolume) bool {
+	cl.volumeFilterFuncs = append(cl.volumeFilterFuncs, func(vols []*containerutil.ContainerVolume) bool {
 		for _, vol := range vols {
 			if (vol.Source != "" && vol.Source == value) ||
 				(vol.Destination != "" && vol.Destination == value) ||
@@ -231,12 +242,16 @@ func (cl *containerFilterContext) matchesTaskFilters(ctx context.Context, contai
 	defer cancel()
 	task, err := container.Task(ctx, nil)
 	if err != nil {
-		logrus.Warn(err)
+		if errdefs.IsNotFound(err) {
+			// Check if we want to filter created containers
+			return cl.matchesExitedFilter(containerd.Status{Status: containerd.Created}) && cl.matchesStatusFilter(containerd.Status{Status: containerd.Created})
+		}
+		log.G(ctx).Warn(err)
 		return false
 	}
 	status, err := task.Status(ctx)
 	if err != nil {
-		logrus.Warn(err)
+		log.G(ctx).Warn(err)
 		return false
 	}
 	return cl.matchesExitedFilter(status) && cl.matchesStatusFilter(status)
@@ -262,6 +277,7 @@ func (cl *containerFilterContext) matchesStatusFilter(status containerd.Status) 
 	if len(cl.statusFilterFuncs) == 0 {
 		return true
 	}
+	cl.all = true
 	for _, statusFilterFunc := range cl.statusFilterFuncs {
 		if !statusFilterFunc(status.Status) {
 			continue
@@ -288,7 +304,7 @@ func (cl *containerFilterContext) matchesNameFilter(info containers.Container) b
 	if len(cl.nameFilterFuncs) == 0 {
 		return true
 	}
-	cName := getPrintableContainerName(info.Labels)
+	cName := containerutil.GetContainerName(info.Labels)
 	for _, nameFilterFunc := range cl.nameFilterFuncs {
 		if !nameFilterFunc(cName) {
 			continue
@@ -337,7 +353,7 @@ func (cl *containerFilterContext) matchesVolumeFilter(info containers.Container)
 	if len(cl.volumeFilterFuncs) == 0 {
 		return true
 	}
-	vols := getContainerVolumes(info.Labels)
+	vols := containerutil.GetContainerVolumes(info.Labels)
 	for _, volumeFilterFunc := range cl.volumeFilterFuncs {
 		if !volumeFilterFunc(vols) {
 			continue
@@ -367,7 +383,7 @@ func idOrNameFilter(ctx context.Context, containers []containerd.Container, valu
 		if err != nil {
 			return nil, err
 		}
-		if strings.HasPrefix(info.ID, value) || strings.Contains(getPrintableContainerName(info.Labels), value) {
+		if strings.HasPrefix(info.ID, value) || strings.Contains(containerutil.GetContainerName(info.Labels), value) {
 			return &info, nil
 		}
 	}

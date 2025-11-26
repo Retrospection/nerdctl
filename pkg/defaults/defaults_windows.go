@@ -17,13 +17,15 @@
 package defaults
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 )
 
-const AppArmorProfileName = ""
-const Runtime = "io.containerd.runhcs.v1"
+const (
+	AppArmorProfileName = ""
+	SeccompProfileName  = ""
+	Runtime             = "io.containerd.runhcs.v1"
+)
 
 func DataRoot() string {
 	return filepath.Join(os.Getenv("ProgramData"), "nerdctl")
@@ -37,12 +39,8 @@ func CNINetConfPath() string {
 	return filepath.Join(os.Getenv("ProgramFiles"), "containerd", "cni", "conf")
 }
 
-func CNIRuntimeDir() string {
-	return ""
-}
-
-func BuildKitHost() string {
-	return fmt.Sprint("\\\\.\\pipe\\buildkit")
+func CNIRuntimeDir() (string, error) {
+	return "", nil
 }
 
 func IsSystemdAvailable() bool {
@@ -78,4 +76,8 @@ func HostsDirs() []string {
 
 func HostGatewayIP() string {
 	return ""
+}
+
+func CDISpecDirs() []string {
+	return []string{}
 }

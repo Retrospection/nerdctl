@@ -21,30 +21,42 @@ import (
 	"encoding/csv"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/compose-spec/compose-go/types"
-	"github.com/containerd/containerd/contrib/nvidia"
-	"github.com/containerd/containerd/identifiers"
-	"github.com/containerd/nerdctl/pkg/reflectutil"
+	"github.com/compose-spec/compose-go/v2/types"
 
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/containerd/v2/contrib/nvidia"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/identifiers"
+	"github.com/containerd/nerdctl/v2/pkg/reflectutil"
 )
 
 // ComposeExtensionKey defines fields used to implement extension features.
 const (
-	ComposeVerify           = "x-nerdctl-verify"
-	ComposeCosignPublicKey  = "x-nerdctl-cosign-public-key"
-	ComposeSign             = "x-nerdctl-sign"
-	ComposeCosignPrivateKey = "x-nerdctl-cosign-private-key"
+	ComposeVerify                            = "x-nerdctl-verify"
+	ComposeCosignPublicKey                   = "x-nerdctl-cosign-public-key"
+	ComposeSign                              = "x-nerdctl-sign"
+	ComposeCosignPrivateKey                  = "x-nerdctl-cosign-private-key"
+	ComposeCosignCertificateIdentity         = "x-nerdctl-cosign-certificate-identity"
+	ComposeCosignCertificateIdentityRegexp   = "x-nerdctl-cosign-certificate-identity-regexp"
+	ComposeCosignCertificateOidcIssuer       = "x-nerdctl-cosign-certificate-oidc-issuer"
+	ComposeCosignCertificateOidcIssuerRegexp = "x-nerdctl-cosign-certificate-oidc-issuer-regexp"
 )
+
+// Separator is used for naming components (e.g., service image or container)
+// https://github.com/docker/compose/blob/8c39b5b7fd4210a69d07885835f7ff826aaa1cd8/pkg/api/api.go#L483
+const Separator = "-"
 
 func warnUnknownFields(svc types.ServiceConfig) {
 	if unknown := reflectutil.UnknownNonEmptyFields(&svc,
 		"Name",
+		"Annotations",
 		"Build",
 		"BlkioConfig",
 		"CapAdd",
@@ -87,6 +99,7 @@ func warnUnknownFields(svc types.ServiceConfig) {
 		"Secrets",
 		"Scale",
 		"SecurityOpt",
+		"ShmSize",
 		"StopGracePeriod",
 		"StopSignal",
 		"Sysctls",
@@ -98,14 +111,14 @@ func warnUnknownFields(svc types.ServiceConfig) {
 		"Volumes",
 		"Ulimits",
 	); len(unknown) > 0 {
-		logrus.Warnf("Ignoring: service %s: %+v", svc.Name, unknown)
+		log.L.Warnf("Ignoring: service %s: %+v", svc.Name, unknown)
 	}
 
 	if svc.BlkioConfig != nil {
 		if unknown := reflectutil.UnknownNonEmptyFields(svc.BlkioConfig,
 			"Weight",
 		); len(unknown) > 0 {
-			logrus.Warnf("Ignoring: service %s: blkio_config: %+v", svc.Name, unknown)
+			log.L.Warnf("Ignoring: service %s: blkio_config: %+v", svc.Name, unknown)
 		}
 	}
 
@@ -113,13 +126,13 @@ func warnUnknownFields(svc types.ServiceConfig) {
 		if unknown := reflectutil.UnknownNonEmptyFields(&dep,
 			"Condition",
 		); len(unknown) > 0 {
-			logrus.Warnf("Ignoring: service %s: depends_on: %s: %+v", svc.Name, depName, unknown)
+			log.L.Warnf("Ignoring: service %s: depends_on: %s: %+v", svc.Name, depName, unknown)
 		}
 		switch dep.Condition {
 		case "", types.ServiceConditionStarted:
 			// NOP
 		default:
-			logrus.Warnf("Ignoring: service %s: depends_on: %s: condition %s", svc.Name, depName, dep.Condition)
+			log.L.Warnf("Ignoring: service %s: depends_on: %s: condition %s", svc.Name, depName, dep.Condition)
 		}
 	}
 
@@ -129,34 +142,34 @@ func warnUnknownFields(svc types.ServiceConfig) {
 			"RestartPolicy",
 			"Resources",
 		); len(unknown) > 0 {
-			logrus.Warnf("Ignoring: service %s: deploy: %+v", svc.Name, unknown)
+			log.L.Warnf("Ignoring: service %s: deploy: %+v", svc.Name, unknown)
 		}
 		if svc.Deploy.RestartPolicy != nil {
 			if unknown := reflectutil.UnknownNonEmptyFields(svc.Deploy.RestartPolicy,
 				"Condition",
 			); len(unknown) > 0 {
-				logrus.Warnf("Ignoring: service %s: deploy.restart_policy: %+v", svc.Name, unknown)
+				log.L.Warnf("Ignoring: service %s: deploy.restart_policy: %+v", svc.Name, unknown)
 			}
 		}
 		if unknown := reflectutil.UnknownNonEmptyFields(svc.Deploy.Resources,
 			"Limits",
 			"Reservations",
 		); len(unknown) > 0 {
-			logrus.Warnf("Ignoring: service %s: deploy.resources: %+v", svc.Name, unknown)
+			log.L.Warnf("Ignoring: service %s: deploy.resources: %+v", svc.Name, unknown)
 		}
 		if svc.Deploy.Resources.Limits != nil {
 			if unknown := reflectutil.UnknownNonEmptyFields(svc.Deploy.Resources.Limits,
 				"NanoCPUs",
 				"MemoryBytes",
 			); len(unknown) > 0 {
-				logrus.Warnf("Ignoring: service %s: deploy.resources.resources: %+v", svc.Name, unknown)
+				log.L.Warnf("Ignoring: service %s: deploy.resources.resources: %+v", svc.Name, unknown)
 			}
 		}
 		if svc.Deploy.Resources.Reservations != nil {
 			if unknown := reflectutil.UnknownNonEmptyFields(svc.Deploy.Resources.Reservations,
 				"Devices",
 			); len(unknown) > 0 {
-				logrus.Warnf("Ignoring: service %s: deploy.resources.resources.reservations: %+v", svc.Name, unknown)
+				log.L.Warnf("Ignoring: service %s: deploy.resources.resources.reservations: %+v", svc.Name, unknown)
 			}
 			for i, dev := range svc.Deploy.Resources.Reservations.Devices {
 				if unknown := reflectutil.UnknownNonEmptyFields(dev,
@@ -165,7 +178,7 @@ func warnUnknownFields(svc types.ServiceConfig) {
 					"Count",
 					"IDs",
 				); len(unknown) > 0 {
-					logrus.Warnf("Ignoring: service %s: deploy.resources.resources.reservations.devices[%d]: %+v",
+					log.L.Warnf("Ignoring: service %s: deploy.resources.resources.reservations.devices[%d]: %+v",
 						svc.Name, i, unknown)
 				}
 			}
@@ -178,11 +191,13 @@ func warnUnknownFields(svc types.ServiceConfig) {
 type Container struct {
 	Name    string   // e.g., "compose-wordpress_wordpress_1"
 	RunArgs []string // {"--pull=never", ...}
+	Mkdir   []string // For Bind.CreateHostPath
 }
 
 type Build struct {
-	Force     bool     // force build even if already present
-	BuildArgs []string // {"-t", "example.com/foo", "--target", "foo", "/path/to/ctx"}
+	Force            bool     // force build even if already present
+	BuildArgs        []string // {"-t", "example.com/foo", "--target", "foo", "/path/to/ctx"}
+	DockerfileInline string   // store contents of dockerfile_inline field is specified
 	// TODO: call BuildKit API directly without executing `nerdctl build`
 }
 
@@ -201,10 +216,10 @@ func getReplicas(svc types.ServiceConfig) (int, error) {
 	// https://github.com/compose-spec/compose-go/commit/958cb4f953330a3d1303961796d826b7f79132d7
 
 	if svc.Deploy != nil && svc.Deploy.Replicas != nil {
-		replicas = int(*svc.Deploy.Replicas)
+		replicas = int(*svc.Deploy.Replicas) // nolint:unconvert
 	}
 
-	if replicas < 1 {
+	if replicas < 0 {
 		return 0, fmt.Errorf("invalid replicas: %d", replicas)
 	}
 	return replicas, nil
@@ -213,15 +228,15 @@ func getReplicas(svc types.ServiceConfig) (int, error) {
 func getCPULimit(svc types.ServiceConfig) (string, error) {
 	var limit string
 	if svc.CPUS > 0 {
-		logrus.Warn("cpus is deprecated, use deploy.resources.limits.cpus")
+		log.L.Warn("cpus is deprecated, use deploy.resources.limits.cpus")
 		limit = fmt.Sprintf("%f", svc.CPUS)
 	}
 	if svc.Deploy != nil && svc.Deploy.Resources.Limits != nil {
-		if nanoCPUs := svc.Deploy.Resources.Limits.NanoCPUs; nanoCPUs != "" {
+		if nanoCPUs := svc.Deploy.Resources.Limits.NanoCPUs; nanoCPUs != 0 {
 			if svc.CPUS > 0 {
-				logrus.Warnf("deploy.resources.limits.cpus and cpus (deprecated) must not be set together, ignoring cpus=%f", svc.CPUS)
+				log.L.Warnf("deploy.resources.limits.cpus and cpus (deprecated) must not be set together, ignoring cpus=%f", svc.CPUS)
 			}
-			limit = nanoCPUs
+			limit = strconv.FormatFloat(float64(nanoCPUs), 'f', 2, 32)
 		}
 	}
 	return limit, nil
@@ -230,13 +245,13 @@ func getCPULimit(svc types.ServiceConfig) (string, error) {
 func getMemLimit(svc types.ServiceConfig) (types.UnitBytes, error) {
 	var limit types.UnitBytes
 	if svc.MemLimit > 0 {
-		logrus.Warn("mem_limit is deprecated, use deploy.resources.limits.memory")
+		log.L.Warn("mem_limit is deprecated, use deploy.resources.limits.memory")
 		limit = svc.MemLimit
 	}
 	if svc.Deploy != nil && svc.Deploy.Resources.Limits != nil {
 		if memoryBytes := svc.Deploy.Resources.Limits.MemoryBytes; memoryBytes > 0 {
 			if svc.MemLimit > 0 && memoryBytes != svc.MemLimit {
-				logrus.Warnf("deploy.resources.limits.memory and mem_limit (deprecated) must not be set together, ignoring mem_limit=%d", svc.MemLimit)
+				log.L.Warnf("deploy.resources.limits.memory and mem_limit (deprecated) must not be set together, ignoring mem_limit=%d", svc.MemLimit)
 			}
 			limit = memoryBytes
 		}
@@ -315,13 +330,13 @@ func getRestart(svc types.ServiceConfig) (string, error) {
 		if restartFailurePat.MatchString(svc.Restart) {
 			restartFlag = svc.Restart
 		} else {
-			logrus.Warnf("Ignoring: service %s: restart=%q (unknown)", svc.Name, svc.Restart)
+			log.L.Warnf("Ignoring: service %s: restart=%q (unknown)", svc.Name, svc.Restart)
 		}
 	}
 
 	if svc.Deploy != nil && svc.Deploy.RestartPolicy != nil {
 		if svc.Restart != "" {
-			logrus.Warnf("deploy.restart_policy and restart must not be set together, ignoring restart=%s", svc.Restart)
+			log.L.Warnf("deploy.restart_policy and restart must not be set together, ignoring restart=%s", svc.Restart)
 		}
 		switch cond := svc.Deploy.RestartPolicy.Condition; cond {
 		case "", "any":
@@ -333,9 +348,9 @@ func getRestart(svc types.ServiceConfig) (string, error) {
 		case "no":
 			return "", fmt.Errorf("deploy.restart_policy.condition: \"no\" is invalid, did you mean \"none\"?")
 		case "on-failure":
-			logrus.Warnf("Ignoring: service %s: deploy.restart_policy.condition=%q (unimplemented)", svc.Name, cond)
+			log.L.Warnf("Ignoring: service %s: deploy.restart_policy.condition=%q (unimplemented)", svc.Name, cond)
 		default:
-			logrus.Warnf("Ignoring: service %s: deploy.restart_policy.condition=%q (unknown)", svc.Name, cond)
+			log.L.Warnf("Ignoring: service %s: deploy.restart_policy.condition=%q (unknown)", svc.Name, cond)
 		}
 	}
 
@@ -352,7 +367,7 @@ func getNetworks(project *types.Project, svc types.ServiceConfig) ([]networkName
 	var fullNames []networkNamePair // nolint: prealloc
 
 	if svc.Net != "" {
-		logrus.Warn("net is deprecated, use network_mode or networks")
+		log.L.Warn("net is deprecated, use network_mode or networks")
 		if len(svc.Networks) > 0 {
 			return nil, errors.New("networks and net must not be set together")
 		}
@@ -371,7 +386,7 @@ func getNetworks(project *types.Project, svc types.ServiceConfig) ([]networkName
 			return nil, errors.New("net and network_mode must not be set together")
 		}
 		if strings.Contains(svc.NetworkMode, ":") {
-			if !strings.HasPrefix(svc.NetworkMode, "container:") {
+			if !strings.HasPrefix(svc.NetworkMode, "container:") && !strings.HasPrefix(svc.NetworkMode, "ns:") {
 				return nil, fmt.Errorf("unsupported network_mode: %q", svc.NetworkMode)
 			}
 		}
@@ -416,7 +431,7 @@ func Parse(project *types.Project, svc types.ServiceConfig) (*Service, error) {
 		}
 	} else {
 		if parsed.Image == "" {
-			parsed.Image = fmt.Sprintf("%s_%s", project.Name, svc.Name)
+			parsed.Image = DefaultImageName(project.Name, svc.Name)
 		}
 		parsed.Build, err = parseBuildConfig(svc.Build, project, parsed.Image)
 		if err != nil {
@@ -436,7 +451,7 @@ func Parse(project *types.Project, svc types.ServiceConfig) (*Service, error) {
 		parsed.Build.Force = true
 		parsed.PullMode = "never"
 	default:
-		logrus.Warnf("Ignoring: service %s: pull_policy: %q", svc.Name, svc.PullPolicy)
+		log.L.Warnf("Ignoring: service %s: pull_policy: %q", svc.Name, svc.PullPolicy)
 	}
 
 	for i := 0; i < replicas; i++ {
@@ -453,7 +468,7 @@ func Parse(project *types.Project, svc types.ServiceConfig) (*Service, error) {
 func newContainer(project *types.Project, parsed *Service, i int) (*Container, error) {
 	svc := *parsed.Unparsed
 	var c Container
-	c.Name = fmt.Sprintf("%s_%s_%d", project.Name, svc.Name, i+1)
+	c.Name = DefaultContainerName(project.Name, svc.Name, strconv.Itoa(i+1))
 	if svc.ContainerName != "" {
 		if i != 0 {
 			return nil, errors.New("container_name must not be specified when replicas != 1")
@@ -464,6 +479,14 @@ func newContainer(project *types.Project, parsed *Service, i int) (*Container, e
 	c.RunArgs = []string{
 		"--name=" + c.Name,
 		"--pull=never", // because image will be ensured before running replicas with `nerdctl run`.
+	}
+
+	for k, v := range svc.Annotations {
+		if v == "" {
+			c.RunArgs = append(c.RunArgs, fmt.Sprintf("--annotation=%s", k))
+		} else {
+			c.RunArgs = append(c.RunArgs, fmt.Sprintf("--annotation=%s=%s", k, v))
+		}
 	}
 
 	if svc.BlkioConfig != nil && svc.BlkioConfig.Weight != 0 {
@@ -493,7 +516,7 @@ func newContainer(project *types.Project, parsed *Service, i int) (*Container, e
 	}
 
 	for _, v := range svc.Devices {
-		c.RunArgs = append(c.RunArgs, fmt.Sprintf("--device=%s", v))
+		c.RunArgs = append(c.RunArgs, fmt.Sprintf("--device=%s:%s:%s", v.Source, v.Target, v.Permissions))
 	}
 
 	for _, v := range svc.DNS {
@@ -518,7 +541,9 @@ func newContainer(project *types.Project, parsed *Service, i int) (*Container, e
 		}
 	}
 	for k, v := range svc.ExtraHosts {
-		c.RunArgs = append(c.RunArgs, fmt.Sprintf("--add-host=%s:%s", k, v))
+		for _, h := range v {
+			c.RunArgs = append(c.RunArgs, fmt.Sprintf("--add-host=%s:%s", k, h))
+		}
 	}
 
 	if svc.Init != nil && *svc.Init {
@@ -571,6 +596,9 @@ func newContainer(project *types.Project, parsed *Service, i int) (*Container, e
 		if value, ok := svc.Networks[net.shortNetworkName]; ok {
 			if value != nil && value.Ipv4Address != "" {
 				c.RunArgs = append(c.RunArgs, "--ip="+value.Ipv4Address)
+			}
+			if value != nil && value.MacAddress != "" {
+				c.RunArgs = append(c.RunArgs, "--mac-address="+value.MacAddress)
 			}
 		}
 	}
@@ -642,6 +670,10 @@ func newContainer(project *types.Project, parsed *Service, i int) (*Container, e
 		c.RunArgs = append(c.RunArgs, "--runtime="+svc.Runtime)
 	}
 
+	if svc.ShmSize > 0 {
+		c.RunArgs = append(c.RunArgs, fmt.Sprintf("--shm-size=%d", svc.ShmSize))
+	}
+
 	for _, v := range svc.SecurityOpt {
 		c.RunArgs = append(c.RunArgs, fmt.Sprintf("--security-opt=%s", v))
 	}
@@ -658,12 +690,17 @@ func newContainer(project *types.Project, parsed *Service, i int) (*Container, e
 		c.RunArgs = append(c.RunArgs, "--user="+svc.User)
 	}
 
+	for _, v := range svc.GroupAdd {
+		c.RunArgs = append(c.RunArgs, fmt.Sprintf("--group-add=%s", v))
+	}
+
 	for _, v := range svc.Volumes {
-		vStr, err := serviceVolumeConfigToFlagV(v, project)
+		vStr, mkdir, err := serviceVolumeConfigToFlagV(v, project)
 		if err != nil {
 			return nil, err
 		}
 		c.RunArgs = append(c.RunArgs, "-v="+vStr)
+		c.Mkdir = mkdir
 	}
 
 	for _, config := range svc.Configs {
@@ -709,7 +746,7 @@ func servicePortConfigToFlagP(c types.ServicePortConfig) (string, error) {
 		"Published",
 		"Protocol",
 	); len(unknown) > 0 {
-		logrus.Warnf("Ignoring: port: %+v", unknown)
+		log.L.Warnf("Ignoring: port: %+v", unknown)
 	}
 	switch c.Mode {
 	case "", "ingress":
@@ -733,7 +770,7 @@ func servicePortConfigToFlagP(c types.ServicePortConfig) (string, error) {
 	return s, nil
 }
 
-func serviceVolumeConfigToFlagV(c types.ServiceVolumeConfig, project *types.Project) (string, error) {
+func serviceVolumeConfigToFlagV(c types.ServiceVolumeConfig, project *types.Project) (flagV string, mkdir []string, err error) {
 	if unknown := reflectutil.UnknownNonEmptyFields(&c,
 		"Type",
 		"Source",
@@ -742,26 +779,25 @@ func serviceVolumeConfigToFlagV(c types.ServiceVolumeConfig, project *types.Proj
 		"Bind",
 		"Volume",
 	); len(unknown) > 0 {
-		logrus.Warnf("Ignoring: volume: %+v", unknown)
+		log.L.Warnf("Ignoring: volume: %+v", unknown)
 	}
 	if c.Bind != nil {
-		// c.Bind is expected to be a non-nil reference to an empty Bind struct
-		if unknown := reflectutil.UnknownNonEmptyFields(c.Bind); len(unknown) > 0 {
-			logrus.Warnf("Ignoring: volume: Bind: %+v", unknown)
+		if unknown := reflectutil.UnknownNonEmptyFields(c.Bind, "CreateHostPath", "Propagation"); len(unknown) > 0 {
+			log.L.Warnf("Ignoring: volume: Bind: %+v", unknown)
 		}
 	}
 	if c.Volume != nil {
 		// c.Volume is expected to be a non-nil reference to an empty Volume struct
 		if unknown := reflectutil.UnknownNonEmptyFields(c.Volume); len(unknown) > 0 {
-			logrus.Warnf("Ignoring: volume: Volume: %+v", unknown)
+			log.L.Warnf("Ignoring: volume: Volume: %+v", unknown)
 		}
 	}
 
 	if c.Target == "" {
-		return "", errors.New("volume target is missing")
+		return "", nil, errors.New("volume target is missing")
 	}
 	if !filepath.IsAbs(c.Target) {
-		return "", fmt.Errorf("volume target must be an absolute path, got %q", c.Target)
+		return "", nil, fmt.Errorf("volume target must be an absolute path, got %q", c.Target)
 	}
 
 	if c.Source == "" {
@@ -770,15 +806,16 @@ func serviceVolumeConfigToFlagV(c types.ServiceVolumeConfig, project *types.Proj
 		if c.ReadOnly {
 			s += ":ro"
 		}
-		return s, nil
+		return s, mkdir, nil
 	}
 
 	var src string
+	var opts []string
 	switch c.Type {
 	case "volume":
 		vol, ok := project.Volumes[c.Source]
 		if !ok {
-			return "", fmt.Errorf("invalid volume %q", c.Source)
+			return "", nil, fmt.Errorf("invalid volume %q", c.Source)
 		}
 		// c.Source is like "db_data", vol.Name is like "compose-wordpress_db_data"
 		src = vol.Name
@@ -787,16 +824,27 @@ func serviceVolumeConfigToFlagV(c types.ServiceVolumeConfig, project *types.Proj
 		var err error
 		src, err = filepath.Abs(src)
 		if err != nil {
-			return "", fmt.Errorf("invalid relative path %q: %w", c.Source, err)
+			return "", nil, fmt.Errorf("invalid relative path %q: %w", c.Source, err)
+		}
+		if c.Bind != nil && c.Bind.CreateHostPath {
+			if _, stErr := os.Stat(src); errors.Is(stErr, os.ErrNotExist) {
+				mkdir = append(mkdir, src)
+			}
+		}
+		if c.Bind != nil && c.Bind.Propagation != "" {
+			opts = append(opts, c.Bind.Propagation)
 		}
 	default:
-		return "", fmt.Errorf("unsupported volume type: %q", c.Type)
+		return "", nil, fmt.Errorf("unsupported volume type: %q", c.Type)
 	}
 	s := fmt.Sprintf("%s:%s", src, c.Target)
 	if c.ReadOnly {
-		s += ":ro"
+		opts = append(opts, "ro")
 	}
-	return s, nil
+	if len(opts) > 0 {
+		s = fmt.Sprintf("%s:%s", s, strings.Join(opts, ","))
+	}
+	return s, mkdir, nil
 }
 
 func fileReferenceConfigToFlagV(c types.FileReferenceConfig, project *types.Project, secret bool) (string, error) {
@@ -807,11 +855,11 @@ func fileReferenceConfigToFlagV(c types.FileReferenceConfig, project *types.Proj
 	if unknown := reflectutil.UnknownNonEmptyFields(&c,
 		"Source", "Target", "UID", "GID", "Mode",
 	); len(unknown) > 0 {
-		logrus.Warnf("Ignoring: %s: %+v", objType, unknown)
+		log.L.Warnf("Ignoring: %s: %+v", objType, unknown)
 	}
 
-	if err := identifiers.Validate(c.Source); err != nil {
-		return "", fmt.Errorf("%s source %q is invalid: %w", objType, c.Source, err)
+	if err := identifiers.ValidateDockerCompat(c.Source); err != nil {
+		return "", fmt.Errorf("invalid source name for %s: %w", objType, err)
 	}
 
 	var obj types.FileObjectConfig
@@ -866,4 +914,14 @@ func fileReferenceConfigToFlagV(c types.FileReferenceConfig, project *types.Proj
 
 	s := fmt.Sprintf("%s:%s:ro", src, target)
 	return s, nil
+}
+
+// DefaultImageName returns the image name following compose naming logic.
+func DefaultImageName(projectName string, serviceName string) string {
+	return projectName + Separator + serviceName
+}
+
+// DefaultContainerName returns the service container name following compose naming logic.
+func DefaultContainerName(projectName, serviceName, suffix string) string {
+	return DefaultImageName(projectName, serviceName) + Separator + suffix
 }

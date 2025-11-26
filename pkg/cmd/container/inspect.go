@@ -21,19 +21,32 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/nerdctl/pkg/api/types"
-	"github.com/containerd/nerdctl/pkg/containerinspector"
-	"github.com/containerd/nerdctl/pkg/formatter"
-	"github.com/containerd/nerdctl/pkg/idutil/containerwalker"
-	"github.com/containerd/nerdctl/pkg/inspecttypes/dockercompat"
-	"github.com/sirupsen/logrus"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/snapshots"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
+	"github.com/containerd/nerdctl/v2/pkg/clientutil"
+	"github.com/containerd/nerdctl/v2/pkg/containerdutil"
+	"github.com/containerd/nerdctl/v2/pkg/containerinspector"
+	"github.com/containerd/nerdctl/v2/pkg/idutil/containerwalker"
+	"github.com/containerd/nerdctl/v2/pkg/imgutil"
+	"github.com/containerd/nerdctl/v2/pkg/inspecttypes/dockercompat"
+	"github.com/containerd/nerdctl/v2/pkg/portutil"
 )
 
 // Inspect prints detailed information for each container in `containers`.
-func Inspect(ctx context.Context, client *containerd.Client, containers []string, options types.ContainerInspectOptions) error {
+func Inspect(ctx context.Context, client *containerd.Client, containers []string, options types.ContainerInspectOptions) ([]any, error) {
+	dataStore, err := clientutil.DataStore(options.GOptions.DataRoot, options.GOptions.Address)
+	if err != nil {
+		return []any{}, err
+	}
+
 	f := &containerInspector{
-		mode: options.Mode,
+		mode:        options.Mode,
+		size:        options.Size,
+		snapshotter: containerdutil.SnapshotService(client, options.GOptions.Snapshotter),
+		dataStore:   dataStore,
+		namespace:   options.GOptions.Namespace,
 	}
 
 	walker := &containerwalker.ContainerWalker{
@@ -41,18 +54,21 @@ func Inspect(ctx context.Context, client *containerd.Client, containers []string
 		OnFound: f.Handler,
 	}
 
-	err := walker.WalkAll(ctx, containers, true)
-	if len(f.entries) > 0 {
-		if formatErr := formatter.FormatSlice(options.Format, options.Stdout, f.entries); formatErr != nil {
-			logrus.Error(formatErr)
-		}
+	err = walker.WalkAll(ctx, containers, true)
+	if err != nil {
+		return []any{}, err
 	}
-	return err
+
+	return f.entries, nil
 }
 
 type containerInspector struct {
-	mode    string
-	entries []interface{}
+	mode        string
+	size        bool
+	snapshotter snapshots.Snapshotter
+	entries     []interface{}
+	dataStore   string
+	namespace   string
 }
 
 func (x *containerInspector) Handler(ctx context.Context, found containerwalker.Found) error {
@@ -63,6 +79,19 @@ func (x *containerInspector) Handler(ctx context.Context, found containerwalker.
 	if err != nil {
 		return err
 	}
+
+	containerLabels, err := found.Container.Labels(ctx)
+	if err != nil {
+		return err
+	}
+	ports, err := portutil.LoadPortMappings(x.dataStore, x.namespace, n.ID, containerLabels)
+	if err != nil {
+		return err
+	}
+	if n.Process != nil && n.Process.NetNS != nil && len(ports) > 0 {
+		n.Process.NetNS.PortMappings = ports
+	}
+
 	switch x.mode {
 	case "native":
 		x.entries = append(x.entries, n)
@@ -71,7 +100,15 @@ func (x *containerInspector) Handler(ctx context.Context, found containerwalker.
 		if err != nil {
 			return err
 		}
+		if x.size {
+			resourceUsage, allResourceUsage, err := imgutil.ResourceUsage(ctx, x.snapshotter, d.ID)
+			if err == nil {
+				d.SizeRw = &resourceUsage.Size
+				d.SizeRootFs = &allResourceUsage.Size
+			}
+		}
 		x.entries = append(x.entries, d)
+		return err
 	default:
 		return fmt.Errorf("unknown mode %q", x.mode)
 	}

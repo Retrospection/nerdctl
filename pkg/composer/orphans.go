@@ -20,9 +20,10 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/nerdctl/pkg/composer/serviceparser"
-	"github.com/containerd/nerdctl/pkg/labels"
+	containerd "github.com/containerd/containerd/v2/client"
+
+	"github.com/containerd/nerdctl/v2/pkg/composer/serviceparser"
+	"github.com/containerd/nerdctl/v2/pkg/labels"
 )
 
 func (c *Composer) getOrphanContainers(ctx context.Context, parsedServices []*serviceparser.Service) ([]containerd.Container, error) {
@@ -44,7 +45,7 @@ func (c *Composer) getOrphanContainers(ctx context.Context, parsedServices []*se
 		// to any name of given services.
 		containerLabels, err := container.Labels(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("error getting container labels: %s", err)
+			return nil, fmt.Errorf("error getting container labels: %w", err)
 		}
 		containerSvc := containerLabels[labels.ComposeService]
 		if inServices := parsedSvcNames[containerSvc]; !inServices {
